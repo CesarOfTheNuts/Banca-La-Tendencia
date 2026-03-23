@@ -1036,6 +1036,197 @@ create trigger trg_usr_usuarios_actualizado_en BEFORE
 update on usr_usuarios for EACH row
 execute FUNCTION fn_set_updated_at ();
 
+create table public.suc_atm (
+  id bigserial not null,
+  codigo character varying(20) not null,
+  numero_serie character varying(50) not null,
+  id_sucursal bigint not null,
+  tipo_ubicacion character varying(15) not null default 'INTERNO'::character varying,
+  capacidad_maxima_billetes integer not null,
+  monto_maximo numeric(20, 4) not null,
+  monto_min_alerta numeric(20, 4) not null default 0,
+  monto_max_retiro_txn numeric(20, 4) not null,
+  id_estado_caja bigint not null,
+  activo boolean not null default true,
+  en_mantenimiento boolean not null default false,
+  motivo_mantenimiento text null,
+  ultimo_mantenimiento date null,
+  proximo_mantenimiento date null,
+  empresa_soporte text null,
+  telefono_soporte character varying(20) null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_atm primary key (id),
+  constraint uq_suc_atm_numero_serie unique (numero_serie),
+  constraint uq_suc_atm_codigo unique (codigo),
+  constraint fk_suc_atm_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_atm_cfg_estados_caja foreign KEY (id_estado_caja) references cfg_estados_caja (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_atm_usr_usuarios foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_atm_capacidad check ((capacidad_maxima_billetes > 0)),
+  constraint ck_suc_atm_tipo_ubicacion check (
+    (
+      (tipo_ubicacion)::text = any (
+        (
+          array[
+            'INTERNO'::character varying,
+            'EXTERNO'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_suc_atm_montos check (
+    (
+      (monto_maximo > (0)::numeric)
+      and (monto_min_alerta >= (0)::numeric)
+      and (monto_min_alerta < monto_maximo)
+      and (monto_max_retiro_txn > (0)::numeric)
+      and (monto_max_retiro_txn <= monto_maximo)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_atm_id_sucursal on public.suc_atm using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_atm_id_estado_caja on public.suc_atm using btree (id_estado_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_atm_creado_por on public.suc_atm using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_atm_actualizado_en BEFORE
+update on suc_atm for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_boveda (
+  id bigserial not null,
+  codigo character varying(20) not null,
+  id_sucursal bigint not null,
+  descripcion text null,
+  capacidad_maxima numeric(20, 4) not null,
+  efectivo_min_alerta numeric(20, 4) not null default 0,
+  activo boolean not null default true,
+  en_mantenimiento boolean not null default false,
+  motivo_mantenimiento text null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_boveda primary key (id),
+  constraint uq_suc_boveda_codigo unique (codigo),
+  constraint uq_suc_boveda_sucursal unique (id_sucursal),
+  constraint fk_suc_boveda_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_boveda_usr_usuarios foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_boveda_capacidad check (
+    (
+      (capacidad_maxima > (0)::numeric)
+      and (efectivo_min_alerta >= (0)::numeric)
+      and (efectivo_min_alerta < capacidad_maxima)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_boveda_id_sucursal on public.suc_boveda using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_boveda_creado_por on public.suc_boveda using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_boveda_actualizado_en BEFORE
+update on suc_boveda for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_recargas_atm (
+  id bigserial not null,
+  id_atm bigint not null,
+  id_boveda bigint not null,
+  id_moneda bigint not null,
+  monto numeric(20, 4) not null,
+  billetes_cargados integer not null,
+  saldo_antes numeric(20, 4) not null,
+  saldo_despues numeric(20, 4) not null,
+  realizado_por bigint not null,
+  notas text null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_recargas_atm primary key (id),
+  constraint fk_tes_recargas_atm_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_recargas_atm_suc_atm foreign KEY (id_atm) references suc_atm (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_recargas_atm_suc_boveda foreign KEY (id_boveda) references suc_boveda (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_recargas_atm_usr_usuarios foreign KEY (realizado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_recargas_atm_monto check (
+    (
+      (monto > (0)::numeric)
+      and (billetes_cargados > 0)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_recargas_atm_id_atm on public.tes_recargas_atm using btree (id_atm, creado_en) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_recargas_atm_id_boveda on public.tes_recargas_atm using btree (id_boveda) TABLESPACE pg_default;
+
+create table public.tes_saldos_atm (
+  id bigserial not null,
+  id_atm bigint not null,
+  id_moneda bigint not null,
+  saldo_actual numeric(20, 4) not null default 0,
+  saldo_reservado numeric(20, 4) not null default 0,
+  billetes_disponibles integer not null default 0,
+  id_ultima_transaccion bigint null,
+  ultima_actualizacion timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_saldos_atm primary key (id),
+  constraint uq_tes_saldos_atm_par unique (id_atm, id_moneda),
+  constraint fk_tes_saldos_atm_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_atm_mov_transacciones foreign KEY (id_ultima_transaccion) references mov_transacciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_atm_suc_atm foreign KEY (id_atm) references suc_atm (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_saldos_atm_montos check (
+    (
+      (saldo_actual >= (0)::numeric)
+      and (saldo_reservado >= (0)::numeric)
+      and (saldo_reservado <= saldo_actual)
+      and (billetes_disponibles >= 0)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_atm_id_atm on public.tes_saldos_atm using btree (id_atm) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_atm_id_moneda on public.tes_saldos_atm using btree (id_moneda) TABLESPACE pg_default;
+
+create trigger trg_tes_saldos_atm_actualizado_en BEFORE
+update on tes_saldos_atm for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_saldos_boveda (
+  id bigserial not null,
+  id_boveda bigint not null,
+  id_moneda bigint not null,
+  saldo_actual numeric(20, 4) not null default 0,
+  saldo_reservado numeric(20, 4) not null default 0,
+  id_ultima_transaccion bigint null,
+  ultima_actualizacion timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_saldos_boveda primary key (id),
+  constraint uq_tes_saldos_boveda_par unique (id_boveda, id_moneda),
+  constraint fk_tes_saldos_boveda_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_boveda_mov_transacciones foreign KEY (id_ultima_transaccion) references mov_transacciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_boveda_suc_boveda foreign KEY (id_boveda) references suc_boveda (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_saldos_boveda_montos check (
+    (
+      (saldo_actual >= (0)::numeric)
+      and (saldo_reservado >= (0)::numeric)
+      and (saldo_reservado <= saldo_actual)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_boveda_id_boveda on public.tes_saldos_boveda using btree (id_boveda) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_boveda_id_moneda on public.tes_saldos_boveda using btree (id_moneda) TABLESPACE pg_default;
+
+create trigger trg_tes_saldos_boveda_actualizado_en BEFORE
+update on tes_saldos_boveda for EACH row
+execute FUNCTION fn_set_updated_at ();
+
 create view public.v_alertas_activas as
 select
   a.id,
