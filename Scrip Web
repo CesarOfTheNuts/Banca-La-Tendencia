@@ -1,0 +1,1187 @@
+create table public.aud_log_accesos (
+  id bigserial not null,
+  id_usuario bigint null,
+  nombre_usuario_intento character varying(60) not null,
+  ip_origen inet not null,
+  agente_usuario text null,
+  resultado character varying(10) not null,
+  motivo_fallo text null,
+  intento_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_aud_log_accesos primary key (id),
+  constraint fk_aud_log_accesos_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_aud_log_accesos_resultado check (
+    (
+      (resultado)::text = any (
+        (
+          array[
+            'EXITOSO'::character varying,
+            'FALLIDO'::character varying,
+            'BLOQUEADO'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_accesos_id_usuario on public.aud_log_accesos using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_accesos_intento_en on public.aud_log_accesos using btree (intento_en) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_accesos_ip_origen on public.aud_log_accesos using btree (ip_origen) TABLESPACE pg_default;
+
+create table public.aud_log_notificaciones (
+  id bigserial not null,
+  id_alerta bigint not null,
+  canal_notificacion character varying(10) not null,
+  destinatario text not null,
+  mensaje_enviado text not null,
+  enviado_exitosamente boolean not null default false,
+  error_envio text null,
+  enviado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_aud_log_notificaciones primary key (id),
+  constraint fk_aud_log_notificaciones_mov_alertas foreign KEY (id_alerta) references mov_alertas (id) on update CASCADE on delete RESTRICT,
+  constraint ck_aud_log_notificaciones_canal check (
+    (
+      (canal_notificacion)::text = any (
+        (
+          array[
+            'CORREO'::character varying,
+            'SMS'::character varying,
+            'PUSH'::character varying,
+            'WEBHOOK'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_notificaciones_id_alerta on public.aud_log_notificaciones using btree (id_alerta) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_notificaciones_enviado_en on public.aud_log_notificaciones using btree (enviado_en) TABLESPACE pg_default;
+
+create table public.aud_log_operaciones (
+  id bigserial not null,
+  id_usuario bigint not null,
+  id_sesion bigint null,
+  entidad_afectada character varying(60) not null,
+  id_registro_afectado bigint not null,
+  accion character varying(20) not null,
+  datos_anteriores jsonb null,
+  datos_nuevos jsonb null,
+  ip_origen inet null,
+  endpoint_api text null,
+  realizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_aud_log_operaciones primary key (id),
+  constraint fk_aud_log_operaciones_usr_sesiones foreign KEY (id_sesion) references usr_sesiones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_aud_log_operaciones_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_aud_log_operaciones_accion check (
+    (
+      (accion)::text = any (
+        (
+          array[
+            'INSERCION'::character varying,
+            'ACTUALIZACION'::character varying,
+            'ELIMINACION'::character varying,
+            'LECTURA_SENSIBLE'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_operaciones_id_usuario on public.aud_log_operaciones using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_operaciones_realizado_en on public.aud_log_operaciones using btree (realizado_en) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_operaciones_usuario_fecha on public.aud_log_operaciones using btree (id_usuario, realizado_en) TABLESPACE pg_default;
+
+create index IF not exists idx_aud_log_operaciones_entidad_afectada on public.aud_log_operaciones using btree (entidad_afectada, id_registro_afectado) TABLESPACE pg_default;
+
+create table public.cfg_denominaciones (
+  id bigserial not null,
+  id_moneda bigint not null,
+  valor numeric(20, 4) not null,
+  tipo character varying(10) not null,
+  descripcion text null,
+  activo boolean not null default true,
+  constraint pk_cfg_denominaciones primary key (id),
+  constraint fk_cfg_denominaciones_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint ck_cfg_denominaciones_tipo check (
+    (
+      (tipo)::text = any (
+        (
+          array[
+            'BILLETE'::character varying,
+            'MONEDA'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_cfg_denominaciones_valor check ((valor > (0)::numeric))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_cfg_denominaciones_id_moneda on public.cfg_denominaciones using btree (id_moneda) TABLESPACE pg_default;
+
+create table public.cfg_empresas_transporte (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  nombre text not null,
+  rif_rnc character varying(30) null,
+  telefono character varying(20) null,
+  correo text null,
+  contacto_principal text null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_cfg_empresas_transporte primary key (id),
+  constraint uq_cfg_empresas_transporte_codigo unique (codigo)
+) TABLESPACE pg_default;
+
+create table public.cfg_estados_caja (
+  id bigserial not null,
+  codigo character varying(20) not null,
+  nombre text not null,
+  descripcion text null,
+  activo boolean not null default true,
+  constraint pk_cfg_estados_caja primary key (id),
+  constraint uq_cfg_estados_caja_codigo unique (codigo)
+) TABLESPACE pg_default;
+
+create table public.cfg_estados_transaccion (
+  id bigserial not null,
+  codigo character varying(20) not null,
+  nombre text not null,
+  descripcion text null,
+  es_terminal boolean not null default false,
+  activo boolean not null default true,
+  constraint pk_cfg_estados_transaccion primary key (id),
+  constraint uq_cfg_estados_transaccion_codigo unique (codigo)
+) TABLESPACE pg_default;
+
+create table public.cfg_monedas (
+  id bigserial not null,
+  codigo_iso character varying(3) not null,
+  nombre text not null,
+  simbolo character varying(5) not null,
+  decimales integer not null,
+  es_moneda_base boolean not null default false,
+  activo boolean not null default true,
+  constraint pk_cfg_monedas primary key (id),
+  constraint uq_cfg_monedas_codigo_iso unique (codigo_iso),
+  constraint ck_cfg_monedas_decimales check (
+    (
+      (decimales >= 0)
+      and (decimales <= 8)
+    )
+  )
+) TABLESPACE pg_default;
+
+create table public.cfg_tipos_documento (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  nombre text not null,
+  longitud_min integer not null,
+  longitud_max integer not null,
+  activo boolean not null default true,
+  constraint pk_cfg_tipos_documento primary key (id),
+  constraint uq_cfg_tipos_documento_codigo unique (codigo),
+  constraint ck_cfg_tipos_documento_longitud check (
+    (
+      (longitud_max >= longitud_min)
+      and (longitud_min > 0)
+    )
+  )
+) TABLESPACE pg_default;
+
+create table public.cfg_tipos_transaccion (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  nombre text not null,
+  descripcion text null,
+  requiere_aprobacion boolean not null default false,
+  monto_limite_defecto numeric(20, 4) null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_cfg_tipos_transaccion primary key (id),
+  constraint uq_cfg_tipos_transaccion_codigo unique (codigo)
+) TABLESPACE pg_default;
+
+create trigger trg_cfg_tipos_transaccion_actualizado_en BEFORE
+update on cfg_tipos_transaccion for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.mov_alertas (
+  id bigserial not null,
+  id_transaccion bigint null,
+  id_caja bigint null,
+  id_sucursal bigint null,
+  tipo_alerta character varying(20) not null,
+  nivel_criticidad character varying(10) not null,
+  mensaje text not null,
+  resuelta boolean not null default false,
+  resuelta_por bigint null,
+  resuelta_en timestamp with time zone null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_mov_alertas primary key (id),
+  constraint fk_mov_alertas_mov_transacciones foreign KEY (id_transaccion) references mov_transacciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_alertas_suc_cajas foreign KEY (id_caja) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_alertas_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_alertas_usr_usuarios foreign KEY (resuelta_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_mov_alertas_criticidad check (
+    (
+      (nivel_criticidad)::text = any (
+        (
+          array[
+            'VERDE'::character varying,
+            'AMARILLO'::character varying,
+            'ROJO'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_mov_alertas_tipo check (
+    (
+      (tipo_alerta)::text = any (
+        (
+          array[
+            'DESBALANCE'::character varying,
+            'LIMITE_EXCEDIDO'::character varying,
+            'FONDOS_BAJOS'::character varying,
+            'FONDOS_ALTOS'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_alertas_id_transaccion on public.mov_alertas using btree (id_transaccion) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_alertas_id_caja on public.mov_alertas using btree (id_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_alertas_id_sucursal on public.mov_alertas using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_alertas_resuelta on public.mov_alertas using btree (resuelta) TABLESPACE pg_default
+where
+  (resuelta = false);
+
+create table public.mov_aprobaciones (
+  id bigserial not null,
+  id_transaccion bigint not null,
+  id_aprobador bigint not null,
+  accion character varying(10) not null,
+  comentarios text null,
+  accion_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  nivel_aprobacion integer not null default 1,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_mov_aprobaciones primary key (id),
+  constraint fk_mov_aprobaciones_mov_transacciones foreign KEY (id_transaccion) references mov_transacciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_aprobaciones_usr_usuarios foreign KEY (id_aprobador) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_mov_aprobaciones_accion check (
+    (
+      (accion)::text = any (
+        (
+          array[
+            'APROBADA'::character varying,
+            'RECHAZADA'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_mov_aprobaciones_nivel check ((nivel_aprobacion > 0))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_aprobaciones_id_transaccion on public.mov_aprobaciones using btree (id_transaccion) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_aprobaciones_id_aprobador on public.mov_aprobaciones using btree (id_aprobador) TABLESPACE pg_default;
+
+
+create table public.mov_limites_usuario (
+  id bigserial not null,
+  id_usuario bigint not null,
+  id_tipo_transaccion bigint not null,
+  monto_max_individual numeric(20, 4) not null,
+  monto_max_diario numeric(20, 4) not null,
+  umbral_doble_aprobacion numeric(20, 4) not null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_mov_limites_usuario primary key (id),
+  constraint uq_mov_limites_usuario_par unique (id_usuario, id_tipo_transaccion),
+  constraint fk_mov_limites_usuario_cfg_tipos_transaccion foreign KEY (id_tipo_transaccion) references cfg_tipos_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_limites_usuario_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_limites_usuario_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_mov_limites_usuario_montos check (
+    (
+      (monto_max_individual > (0)::numeric)
+      and (monto_max_diario >= monto_max_individual)
+      and (umbral_doble_aprobacion > (0)::numeric)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_limites_usuario_id_usuario on public.mov_limites_usuario using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_limites_usuario_id_tipo_transaccion on public.mov_limites_usuario using btree (id_tipo_transaccion) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_limites_usuario_creado_por on public.mov_limites_usuario using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_mov_limites_usuario_actualizado_en BEFORE
+update on mov_limites_usuario for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.mov_transacciones (
+  id bigserial not null,
+  numero_referencia character varying(50) not null,
+  id_tipo_transaccion bigint not null,
+  id_sesion_caja bigint not null,
+  id_caja_origen bigint null,
+  id_caja_destino bigint null,
+  id_sucursal_origen bigint null,
+  id_sucursal_destino bigint null,
+  id_moneda bigint not null,
+  monto numeric(20, 4) not null,
+  monto_moneda_base numeric(20, 4) not null,
+  tasa_cambio numeric(12, 6) not null default 1.000000,
+  id_estado bigint not null,
+  descripcion text null,
+  numero_cheque character varying(30) null,
+  numero_cuenta_enmascarado character varying(30) null,
+  nombre_cliente text not null,
+  tipo_instrumento character varying(20) not null,
+  requiere_aprobacion boolean not null default false,
+  aprobado_por bigint null,
+  aprobado_en timestamp with time zone null,
+  fecha_valor date not null,
+  ip_origen inet null,
+  canal character varying(20) not null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_mov_transacciones primary key (id),
+  constraint uq_mov_transacciones_numero_referencia unique (numero_referencia),
+  constraint fk_mov_transacciones_suc_cajas_origen foreign KEY (id_caja_origen) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_suc_sucursales_destino foreign KEY (id_sucursal_destino) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_suc_sucursales_origen foreign KEY (id_sucursal_origen) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_usr_usuarios_aprobado_por foreign KEY (aprobado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_cfg_estados_transaccion foreign KEY (id_estado) references cfg_estados_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_cfg_tipos_transaccion foreign KEY (id_tipo_transaccion) references cfg_tipos_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_suc_cajas_destino foreign KEY (id_caja_destino) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_mov_transacciones_suc_sesiones_caja foreign KEY (id_sesion_caja) references suc_sesiones_caja (id) on update CASCADE on delete RESTRICT,
+  constraint ck_mov_transacciones_tipo_instrumento check (
+    (
+      (tipo_instrumento)::text = any (
+        (
+          array[
+            'EFECTIVO'::character varying,
+            'CHEQUE'::character varying,
+            'TRANSFERENCIA_ELECTRONICA'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_mov_transacciones_tasa_cambio check ((tasa_cambio > (0)::numeric)),
+  constraint ck_mov_transacciones_canal check (
+    (
+      (canal)::text = any (
+        (
+          array[
+            'WEB'::character varying,
+            'API'::character varying,
+            'CORE_BANCARIO'::character varying,
+            'MOVIL'::character varying
+          ]
+        )::text[]
+      )
+    )
+  ),
+  constraint ck_mov_transacciones_monto check ((monto > (0)::numeric))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_tipo_transaccion on public.mov_transacciones using btree (id_tipo_transaccion) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_sesion_caja on public.mov_transacciones using btree (id_sesion_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_sucursal_origen on public.mov_transacciones using btree (id_sucursal_origen) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_sucursal_destino on public.mov_transacciones using btree (id_sucursal_destino) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_moneda on public.mov_transacciones using btree (id_moneda) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_id_estado on public.mov_transacciones using btree (id_estado) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_creado_por on public.mov_transacciones using btree (creado_por) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_sucursal_fecha on public.mov_transacciones using btree (id_sucursal_origen, fecha_valor) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_fecha_valor on public.mov_transacciones using btree (fecha_valor) TABLESPACE pg_default;
+
+create index IF not exists idx_mov_transacciones_creado_en on public.mov_transacciones using btree (creado_en) TABLESPACE pg_default;
+
+create trigger trg_mov_transacciones_actualizado_en BEFORE
+update on mov_transacciones for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_arqueo_detalle (
+  id bigserial not null,
+  id_arqueo bigint not null,
+  id_denominacion bigint not null,
+  cantidad integer not null,
+  subtotal numeric(20, 4) not null default 0,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_suc_arqueo_detalle primary key (id),
+  constraint uq_suc_arqueo_detalle_par unique (id_arqueo, id_denominacion),
+  constraint fk_suc_arqueo_detalle_cfg_denominaciones foreign KEY (id_denominacion) references cfg_denominaciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_arqueo_detalle_suc_arqueos foreign KEY (id_arqueo) references suc_arqueos (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_arqueo_detalle_cantidad check ((cantidad >= 0))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueo_detalle_id_arqueo on public.suc_arqueo_detalle using btree (id_arqueo) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueo_detalle_id_denominacion on public.suc_arqueo_detalle using btree (id_denominacion) TABLESPACE pg_default;
+
+create table public.suc_arqueos (
+  id bigserial not null,
+  id_sesion_caja bigint not null,
+  id_usuario_arqueo bigint not null,
+  arqueo_en timestamp with time zone not null,
+  tipo_arqueo character varying(10) not null,
+  monto_sistema numeric(20, 4) not null,
+  total_fisico numeric(20, 4) not null,
+  diferencia numeric GENERATED ALWAYS as ((total_fisico - monto_sistema)) STORED (20, 4) null,
+  justificacion_diferencia text null,
+  id_estado bigint not null,
+  aprobado_por bigint null,
+  aprobado_en timestamp with time zone null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_arqueos primary key (id),
+  constraint fk_suc_arqueos_cfg_estados_transaccion foreign KEY (id_estado) references cfg_estados_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_arqueos_suc_sesiones_caja foreign KEY (id_sesion_caja) references suc_sesiones_caja (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_arqueos_usr_usuarios_arqueo foreign KEY (id_usuario_arqueo) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_arqueos_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_arqueos_usr_usuarios_aprobado_por foreign KEY (aprobado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_arqueos_tipo check (
+    (
+      (tipo_arqueo)::text = any (
+        (
+          array[
+            'PARCIAL'::character varying,
+            'CIERRE'::character varying,
+            'SORPRESA'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueos_id_sesion_caja on public.suc_arqueos using btree (id_sesion_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueos_id_usuario_arqueo on public.suc_arqueos using btree (id_usuario_arqueo) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueos_id_estado on public.suc_arqueos using btree (id_estado) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_arqueos_creado_por on public.suc_arqueos using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_arqueos_actualizado_en BEFORE
+update on suc_arqueos for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_asignaciones_caja (
+  id bigserial not null,
+  id_caja bigint not null,
+  id_usuario bigint not null,
+  fecha_inicio date not null,
+  fecha_fin date null,
+  asignacion_activa boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_asignaciones_caja primary key (id),
+  constraint fk_suc_asignaciones_caja_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_asignaciones_caja_suc_cajas foreign KEY (id_caja) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_asignaciones_caja_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_asignaciones_caja_fechas check (
+    (
+      (fecha_fin is null)
+      or (fecha_fin >= fecha_inicio)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_asignaciones_caja_id_caja on public.suc_asignaciones_caja using btree (id_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_asignaciones_caja_id_usuario on public.suc_asignaciones_caja using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_asignaciones_caja_creado_por on public.suc_asignaciones_caja using btree (creado_por) TABLESPACE pg_default;
+
+create table public.suc_cajas (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  numero_ventanilla integer not null,
+  id_sucursal bigint not null,
+  id_estado_caja bigint not null,
+  descripcion text null,
+  efectivo_min_permitido numeric(20, 4) not null default 0,
+  efectivo_max_permitido numeric(20, 4) not null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_cajas primary key (id),
+  constraint uq_suc_cajas_sucursal_codigo unique (id_sucursal, codigo),
+  constraint fk_suc_cajas_cfg_estados_caja foreign KEY (id_estado_caja) references cfg_estados_caja (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_cajas_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_cajas_usr_usuarios foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_cajas_efectivo check (
+    (
+      (efectivo_max_permitido > efectivo_min_permitido)
+      and (efectivo_min_permitido >= (0)::numeric)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_cajas_id_sucursal on public.suc_cajas using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_cajas_id_estado_caja on public.suc_cajas using btree (id_estado_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_cajas_creado_por on public.suc_cajas using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_cajas_actualizado_en BEFORE
+update on suc_cajas for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_regiones (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  nombre text not null,
+  descripcion text null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_regiones primary key (id),
+  constraint uq_suc_regiones_codigo unique (codigo),
+  constraint fk_suc_regiones_usr_usuarios foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_regiones_creado_por on public.suc_regiones using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_regiones_actualizado_en BEFORE
+update on suc_regiones for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_sesiones_caja (
+  id bigserial not null,
+  id_caja bigint not null,
+  id_usuario_apertura bigint not null,
+  id_usuario_cierre bigint null,
+  apertura_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  cierre_en timestamp with time zone null,
+  monto_apertura numeric(20, 4) not null,
+  monto_cierre numeric(20, 4) null,
+  diferencia numeric(20, 4) null,
+  id_estado_al_cierre bigint null,
+  notas_apertura text null,
+  notas_cierre text null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_sesiones_caja primary key (id),
+  constraint fk_suc_sesiones_caja_cfg_estados_caja foreign KEY (id_estado_al_cierre) references cfg_estados_caja (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sesiones_caja_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sesiones_caja_usr_usuarios_apertura foreign KEY (id_usuario_apertura) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sesiones_caja_usr_usuarios_cierre foreign KEY (id_usuario_cierre) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sesiones_caja_suc_cajas foreign KEY (id_caja) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_sesiones_caja_monto check ((monto_apertura >= (0)::numeric))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sesiones_caja_id_caja on public.suc_sesiones_caja using btree (id_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sesiones_caja_id_usuario_apertura on public.suc_sesiones_caja using btree (id_usuario_apertura) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sesiones_caja_apertura_en on public.suc_sesiones_caja using btree (id_caja, apertura_en) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sesiones_caja_id_estado_cierre on public.suc_sesiones_caja using btree (id_estado_al_cierre) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sesiones_caja_creado_por on public.suc_sesiones_caja using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_sesiones_caja_actualizado_en BEFORE
+update on suc_sesiones_caja for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.suc_sucursales (
+  id bigserial not null,
+  codigo character varying(10) not null,
+  nombre text not null,
+  id_region bigint not null,
+  direccion text not null,
+  ciudad text not null,
+  provincia text not null,
+  pais text not null default 'República Dominicana'::text,
+  latitud numeric(10, 8) null,
+  longitud numeric(11, 8) null,
+  telefono character varying(20) null,
+  correo text null,
+  id_gerente bigint null,
+  efectivo_min_permitido numeric(20, 4) not null default 0,
+  efectivo_max_permitido numeric(20, 4) not null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_suc_sucursales primary key (id),
+  constraint uq_suc_sucursales_codigo unique (codigo),
+  constraint fk_suc_sucursales_suc_regiones foreign KEY (id_region) references suc_regiones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sucursales_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_suc_sucursales_usr_usuarios_gerente foreign KEY (id_gerente) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_suc_sucursales_efectivo check (
+    (
+      (efectivo_max_permitido > efectivo_min_permitido)
+      and (efectivo_min_permitido >= (0)::numeric)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sucursales_id_region on public.suc_sucursales using btree (id_region) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sucursales_id_gerente on public.suc_sucursales using btree (id_gerente) TABLESPACE pg_default;
+
+create index IF not exists idx_suc_sucursales_creado_por on public.suc_sucursales using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_suc_sucursales_actualizado_en BEFORE
+update on suc_sucursales for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_historico_saldos (
+  id bigserial not null,
+  fecha_snapshot date not null,
+  id_caja bigint null,
+  id_sucursal bigint null,
+  id_moneda bigint not null,
+  saldo_apertura numeric(20, 4) not null default 0,
+  saldo_cierre numeric(20, 4) not null default 0,
+  total_entradas numeric(20, 4) not null default 0,
+  total_salidas numeric(20, 4) not null default 0,
+  num_transacciones integer not null default 0,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_historico_saldos primary key (id),
+  constraint fk_tes_historico_saldos_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_historico_saldos_suc_cajas foreign KEY (id_caja) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_historico_saldos_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_historico_saldos_montos check (
+    (
+      (saldo_apertura >= (0)::numeric)
+      and (saldo_cierre >= (0)::numeric)
+      and (total_entradas >= (0)::numeric)
+      and (total_salidas >= (0)::numeric)
+      and (num_transacciones >= 0)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_historico_saldos_fecha_snapshot on public.tes_historico_saldos using btree (fecha_snapshot) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_historico_saldos_id_caja on public.tes_historico_saldos using btree (id_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_historico_saldos_id_sucursal on public.tes_historico_saldos using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_historico_saldos_sucursal_fecha on public.tes_historico_saldos using btree (id_sucursal, fecha_snapshot) TABLESPACE pg_default;
+
+create table public.tes_remesas (
+  id bigserial not null,
+  numero_remesa character varying(30) not null,
+  id_sucursal_origen bigint not null,
+  id_sucursal_destino bigint not null,
+  id_empresa_transporte bigint not null,
+  id_moneda bigint not null,
+  monto_programado numeric(20, 4) not null,
+  monto_entregado numeric(20, 4) null,
+  fecha_programada date not null,
+  salida_en timestamp with time zone null,
+  llegada_en timestamp with time zone null,
+  id_estado bigint not null,
+  numero_guia character varying(60) null,
+  numero_sello character varying(60) null,
+  id_usuario_autoriza bigint not null,
+  notas text null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_tes_remesas primary key (id),
+  constraint uq_tes_remesas_numero unique (numero_remesa),
+  constraint fk_tes_remesas_cfg_estados_transaccion foreign KEY (id_estado) references cfg_estados_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_suc_sucursales_origen foreign KEY (id_sucursal_origen) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_usr_usuarios_autoriza foreign KEY (id_usuario_autoriza) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_suc_sucursales_destino foreign KEY (id_sucursal_destino) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_remesas_cfg_empresas_transporte foreign KEY (id_empresa_transporte) references cfg_empresas_transporte (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_remesas_monto_programado check ((monto_programado > (0)::numeric)),
+  constraint ck_tes_remesas_sucursales check ((id_sucursal_origen <> id_sucursal_destino))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_remesas_id_sucursal_origen on public.tes_remesas using btree (id_sucursal_origen) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_remesas_id_sucursal_destino on public.tes_remesas using btree (id_sucursal_destino) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_remesas_id_empresa on public.tes_remesas using btree (id_empresa_transporte) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_remesas_id_estado on public.tes_remesas using btree (id_estado) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_remesas_creado_por on public.tes_remesas using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_tes_remesas_actualizado_en BEFORE
+update on tes_remesas for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_saldos_caja (
+  id bigserial not null,
+  id_caja bigint not null,
+  id_moneda bigint not null,
+  saldo_actual numeric(20, 4) not null default 0,
+  saldo_reservado numeric(20, 4) not null default 0,
+  id_ultima_transaccion bigint null,
+  ultima_actualizacion timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_saldos_caja primary key (id),
+  constraint uq_tes_saldos_caja_par unique (id_caja, id_moneda),
+  constraint fk_tes_saldos_caja_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_caja_mov_transacciones foreign KEY (id_ultima_transaccion) references mov_transacciones (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_caja_suc_cajas foreign KEY (id_caja) references suc_cajas (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_saldos_caja_montos check (
+    (
+      (saldo_actual >= (0)::numeric)
+      and (saldo_reservado >= (0)::numeric)
+      and (saldo_reservado <= saldo_actual)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_caja_id_caja on public.tes_saldos_caja using btree (id_caja) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_caja_id_moneda on public.tes_saldos_caja using btree (id_moneda) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_caja_id_ultima_transaccion on public.tes_saldos_caja using btree (id_ultima_transaccion) TABLESPACE pg_default;
+
+create trigger trg_tes_saldos_caja_actualizado_en BEFORE
+update on tes_saldos_caja for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_saldos_sucursal (
+  id bigserial not null,
+  id_sucursal bigint not null,
+  id_moneda bigint not null,
+  saldo_total numeric(20, 4) not null default 0,
+  saldo_disponible numeric(20, 4) not null default 0,
+  ultima_actualizacion timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_tes_saldos_sucursal primary key (id),
+  constraint uq_tes_saldos_sucursal_par unique (id_sucursal, id_moneda),
+  constraint fk_tes_saldos_sucursal_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_saldos_sucursal_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_saldos_sucursal_montos check (
+    (
+      (saldo_total >= (0)::numeric)
+      and (saldo_disponible >= (0)::numeric)
+      and (saldo_disponible <= saldo_total)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_sucursal_id_sucursal on public.tes_saldos_sucursal using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_saldos_sucursal_id_moneda on public.tes_saldos_sucursal using btree (id_moneda) TABLESPACE pg_default;
+
+create trigger trg_tes_saldos_sucursal_actualizado_en BEFORE
+update on tes_saldos_sucursal for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.tes_solicitudes_fondos (
+  id bigserial not null,
+  numero_solicitud character varying(30) not null,
+  id_sucursal_solicitante bigint not null,
+  id_sucursal_proveedora bigint null,
+  id_usuario_solicitante bigint not null,
+  id_moneda bigint not null,
+  monto_solicitado numeric(20, 4) not null,
+  monto_aprobado numeric(20, 4) null,
+  motivo text not null,
+  id_estado bigint not null,
+  id_aprobador bigint null,
+  aprobado_en timestamp with time zone null,
+  fecha_requerida date not null,
+  ejecutado_en timestamp with time zone null,
+  notas text null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_tes_solicitudes_fondos primary key (id),
+  constraint uq_tes_solicitudes_fondos_numero unique (numero_solicitud),
+  constraint fk_tes_solicitudes_fondos_cfg_monedas foreign KEY (id_moneda) references cfg_monedas (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_suc_sucursales_pro foreign KEY (id_sucursal_proveedora) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_suc_sucursales_sol foreign KEY (id_sucursal_solicitante) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_usr_usuarios_sol foreign KEY (id_usuario_solicitante) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_usr_usuarios_apr foreign KEY (id_aprobador) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_tes_solicitudes_fondos_cfg_estados_transaccion foreign KEY (id_estado) references cfg_estados_transaccion (id) on update CASCADE on delete RESTRICT,
+  constraint ck_tes_solicitudes_fondos_monto check ((monto_solicitado > (0)::numeric))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_solicitudes_fondos_id_sucursal_sol on public.tes_solicitudes_fondos using btree (id_sucursal_solicitante) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_solicitudes_fondos_id_sucursal_pro on public.tes_solicitudes_fondos using btree (id_sucursal_proveedora) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_solicitudes_fondos_id_estado on public.tes_solicitudes_fondos using btree (id_estado) TABLESPACE pg_default;
+
+create index IF not exists idx_tes_solicitudes_fondos_creado_por on public.tes_solicitudes_fondos using btree (creado_por) TABLESPACE pg_default;
+
+create trigger trg_tes_solicitudes_fondos_actualizado_en BEFORE
+update on tes_solicitudes_fondos for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.usr_permisos (
+  id bigserial not null,
+  codigo character varying(60) not null,
+  nombre text not null,
+  modulo character varying(30) not null,
+  descripcion text null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_usr_permisos primary key (id),
+  constraint uq_usr_permisos_codigo unique (codigo)
+) TABLESPACE pg_default;
+
+create table public.usr_permisos_adicionales_usuario (
+  id bigserial not null,
+  id_usuario bigint not null,
+  id_permiso bigint not null,
+  tipo_otorga character varying(10) not null,
+  fecha_inicio date not null,
+  fecha_fin date null,
+  motivo text not null,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_usr_permisos_adicionales_usuario primary key (id),
+  constraint fk_usr_permisos_adicionales_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_permisos_adicionales_usr_permisos foreign KEY (id_permiso) references usr_permisos (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_permisos_adicionales_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_usr_permisos_adicionales_fechas check (
+    (
+      (fecha_fin is null)
+      or (fecha_fin >= fecha_inicio)
+    )
+  ),
+  constraint ck_usr_permisos_adicionales_tipo check (
+    (
+      (tipo_otorga)::text = any (
+        (
+          array[
+            'OTORGADO'::character varying,
+            'REVOCADO'::character varying
+          ]
+        )::text[]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_permisos_adicionales_id_usuario on public.usr_permisos_adicionales_usuario using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_permisos_adicionales_id_permiso on public.usr_permisos_adicionales_usuario using btree (id_permiso) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_permisos_adicionales_creado_por on public.usr_permisos_adicionales_usuario using btree (creado_por) TABLESPACE pg_default;
+
+create table public.usr_rol_permisos (
+  id bigserial not null,
+  id_rol bigint not null,
+  id_permiso bigint not null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint not null,
+  constraint pk_usr_rol_permisos primary key (id),
+  constraint uq_usr_rol_permisos_par unique (id_rol, id_permiso),
+  constraint fk_usr_rol_permisos_usr_permisos foreign KEY (id_permiso) references usr_permisos (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_rol_permisos_usr_roles foreign KEY (id_rol) references usr_roles (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_rol_permisos_usr_usuarios foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT
+) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_rol_permisos_id_rol on public.usr_rol_permisos using btree (id_rol) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_rol_permisos_id_permiso on public.usr_rol_permisos using btree (id_permiso) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_rol_permisos_creado_por on public.usr_rol_permisos using btree (creado_por) TABLESPACE pg_default;
+
+
+create table public.usr_roles (
+  id bigserial not null,
+  codigo character varying(30) not null,
+  nombre text not null,
+  descripcion text null,
+  nivel_jerarquia integer not null default 1,
+  puede_aprobar boolean not null default false,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_usr_roles primary key (id),
+  constraint uq_usr_roles_codigo unique (codigo),
+  constraint ck_usr_roles_jerarquia check ((nivel_jerarquia > 0))
+) TABLESPACE pg_default;
+
+create trigger trg_usr_roles_actualizado_en BEFORE
+update on usr_roles for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create table public.usr_sesiones (
+  id bigserial not null,
+  id_usuario bigint not null,
+  token_sesion character varying(512) not null,
+  ip_origen inet not null,
+  agente_usuario text null,
+  iniciado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  expira_en timestamp with time zone not null,
+  cerrado_en timestamp with time zone null,
+  motivo_cierre character varying(20) null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  constraint pk_usr_sesiones primary key (id),
+  constraint uq_usr_sesiones_token_sesion unique (token_sesion),
+  constraint fk_usr_sesiones_usr_usuarios foreign KEY (id_usuario) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint ck_usr_sesiones_motivo_cierre check (
+    (
+      (
+        (motivo_cierre)::text = any (
+          (
+            array[
+              'LOGOUT'::character varying,
+              'EXPIRACION'::character varying,
+              'ADMIN'::character varying,
+              'INACTIVIDAD'::character varying
+            ]
+          )::text[]
+        )
+      )
+      or (motivo_cierre is null)
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_sesiones_id_usuario on public.usr_sesiones using btree (id_usuario) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_sesiones_iniciado_en on public.usr_sesiones using btree (iniciado_en) TABLESPACE pg_default;
+
+create table public.usr_usuarios (
+  id bigserial not null,
+  uuid character varying(36) not null,
+  nombre_usuario character varying(60) not null,
+  nombre text not null,
+  apellido text not null,
+  correo text not null,
+  telefono character varying(20) null,
+  hash_contrasena character varying(255) not null,
+  id_rol bigint not null,
+  id_sucursal bigint null,
+  id_tipo_documento bigint not null,
+  numero_documento character varying(30) not null,
+  debe_cambiar_contrasena boolean not null default true,
+  intentos_fallidos integer not null default 0,
+  bloqueado boolean not null default false,
+  bloqueado_en timestamp with time zone null,
+  ultimo_acceso_en timestamp with time zone null,
+  mfa_habilitado boolean not null default false,
+  mfa_secreto character varying(255) null,
+  token_reset_contrasena character varying(255) null,
+  expira_token_reset_en timestamp with time zone null,
+  activo boolean not null default true,
+  creado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  actualizado_en timestamp with time zone not null default CURRENT_TIMESTAMP,
+  creado_por bigint null,
+  ultimo_intento_fallido_en timestamp with time zone null,
+  constraint pk_usr_usuarios primary key (id),
+  constraint uq_usr_usuarios_uuid unique (uuid),
+  constraint uq_usr_usuarios_correo unique (correo),
+  constraint uq_usr_usuarios_nombre_usuario unique (nombre_usuario),
+  constraint fk_usr_usuarios_usr_roles foreign KEY (id_rol) references usr_roles (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_usuarios_cfg_tipos_documento foreign KEY (id_tipo_documento) references cfg_tipos_documento (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_usuarios_creado_por foreign KEY (creado_por) references usr_usuarios (id) on update CASCADE on delete RESTRICT,
+  constraint fk_usr_usuarios_suc_sucursales foreign KEY (id_sucursal) references suc_sucursales (id) on update CASCADE on delete RESTRICT,
+  constraint ck_usr_usuarios_intentos_fallidos check ((intentos_fallidos >= 0))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_usuarios_id_rol on public.usr_usuarios using btree (id_rol) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_usuarios_id_sucursal on public.usr_usuarios using btree (id_sucursal) TABLESPACE pg_default;
+
+create index IF not exists idx_usr_usuarios_id_tipo_documento on public.usr_usuarios using btree (id_tipo_documento) TABLESPACE pg_default;
+
+create trigger trg_usr_usuarios_actualizado_en BEFORE
+update on usr_usuarios for EACH row
+execute FUNCTION fn_set_updated_at ();
+
+create view public.v_alertas_activas as
+select
+  a.id,
+  a.tipo_alerta,
+  a.nivel_criticidad,
+  a.mensaje,
+  s.nombre as nombre_sucursal,
+  c.codigo as codigo_caja,
+  t.numero_referencia as referencia_transaccion,
+  a.creado_en,
+  EXTRACT(
+    epoch
+    from
+      CURRENT_TIMESTAMP - a.creado_en
+  ) / 60::numeric as minutos_abierta
+from
+  mov_alertas a
+  left join suc_sucursales s on s.id = a.id_sucursal
+  left join suc_cajas c on c.id = a.id_caja
+  left join mov_transacciones t on t.id = a.id_transaccion
+where
+  a.resuelta = false
+order by
+  (
+    case a.nivel_criticidad
+      when 'ROJO'::text then 1
+      when 'AMARILLO'::text then 2
+      when 'VERDE'::text then 3
+      else null::integer
+    end
+  ),
+  a.creado_en;
+
+create view public.v_kpi_diario_sucursal as
+select
+  s.id as id_sucursal,
+  s.codigo as codigo_sucursal,
+  s.nombre as nombre_sucursal,
+  m.codigo_iso as moneda,
+  COALESCE(ss.saldo_total, 0::numeric) as saldo_total_actual,
+  count(t.id) as num_transacciones,
+  COALESCE(
+    sum(t.monto) filter (
+      where
+        tt.codigo::text = any (
+          array[
+            'DEP'::character varying,
+            'REM_I'::character varying,
+            'RPLN'::character varying
+          ]::text[]
+        )
+    ),
+    0::numeric
+  ) as total_entradas,
+  COALESCE(
+    sum(t.monto) filter (
+      where
+        tt.codigo::text = any (
+          array[
+            'RET'::character varying,
+            'REM_O'::character varying
+          ]::text[]
+        )
+    ),
+    0::numeric
+  ) as total_salidas,
+  count(t.id) filter (
+    where
+      t.requiere_aprobacion
+      and et.codigo::text = 'PENDIENTE'::text
+  ) as aprobaciones_pendientes,
+  CURRENT_DATE as fecha_reporte
+from
+  suc_sucursales s
+  cross join cfg_monedas m
+  left join mov_transacciones t on t.id_sucursal_origen = s.id
+  and t.fecha_valor = CURRENT_DATE
+  and t.activo = true
+  and t.id_moneda = m.id
+  left join cfg_tipos_transaccion tt on tt.id = t.id_tipo_transaccion
+  left join cfg_estados_transaccion et on et.id = t.id_estado
+  left join tes_saldos_sucursal ss on ss.id_sucursal = s.id
+  and ss.id_moneda = m.id
+where
+  s.activo = true
+  and m.activo = true
+group by
+  s.id,
+  s.codigo,
+  s.nombre,
+  m.codigo_iso,
+  ss.saldo_total;
+
+create view public.v_saldo_actual_cajas as
+select
+  s.id as id_sucursal,
+  s.codigo as codigo_sucursal,
+  s.nombre as nombre_sucursal,
+  c.id as id_caja,
+  c.codigo as codigo_caja,
+  c.numero_ventanilla,
+  ec.codigo as estado_caja,
+  u.nombre_usuario as cajero_actual,
+  (u.nombre || ' '::text) || u.apellido as nombre_completo_cajero,
+  m.codigo_iso as moneda,
+  sc.saldo_actual,
+  sc.saldo_reservado,
+  sc.saldo_actual - sc.saldo_reservado as saldo_disponible,
+  sc.ultima_actualizacion
+from
+  suc_cajas c
+  join suc_sucursales s on s.id = c.id_sucursal
+  join cfg_estados_caja ec on ec.id = c.id_estado_caja
+  left join tes_saldos_caja sc on sc.id_caja = c.id
+  left join cfg_monedas m on m.id = sc.id_moneda
+  left join suc_asignaciones_caja a on a.id_caja = c.id
+  and a.asignacion_activa = true
+  left join usr_usuarios u on u.id = a.id_usuario
+where
+  c.activo = true;
+
+create view public.v_transacciones_hoy as
+select
+  t.id,
+  t.numero_referencia,
+  s.nombre as nombre_sucursal,
+  c.codigo as codigo_caja,
+  tt.nombre as tipo_transaccion,
+  t.tipo_instrumento,
+  m.codigo_iso as moneda,
+  t.monto,
+  t.monto_moneda_base,
+  et.nombre as estado,
+  t.nombre_cliente,
+  u.nombre_usuario as registrado_por,
+  t.canal,
+  t.creado_en
+from
+  mov_transacciones t
+  join cfg_tipos_transaccion tt on tt.id = t.id_tipo_transaccion
+  join cfg_estados_transaccion et on et.id = t.id_estado
+  join cfg_monedas m on m.id = t.id_moneda
+  left join suc_sucursales s on s.id = t.id_sucursal_origen
+  left join suc_sesiones_caja sc on sc.id = t.id_sesion_caja
+  left join suc_cajas c on c.id = sc.id_caja
+  left join usr_usuarios u on u.id = t.creado_por
+where
+  t.fecha_valor = CURRENT_DATE
+  and t.activo = true;
