@@ -1185,3 +1185,1747 @@ from
 where
   t.fecha_valor = CURRENT_DATE
   and t.activo = true;
+NOtA a partir de ahora estaran punto por punto todos los store procedure de la DB: 
+-- ============================================================================================================================
+-- SISTEMA BANCARIO — FUNCIONES CORREGIDAS Y VALIDADAS
+-- Versión final tras análisis comparativo contra el script DDL real (Scrip_Web.txt)
+-- Cambios aplicados:
+--   · Nombres de columna corregidos en todas las funciones
+--   · Patrón de auditoría unificado via fn_registrar_auditoria
+--   · SELECT FOR UPDATE en todos los recursos críticos
+--   · diferencia eliminado del INSERT de suc_arqueos (columna GENERATED ALWAYS AS STORED)
+--   · Orden de UPDATE corregido en fn_completar_transaccion y reversar_transaccion
+--     para respetar CHECK (saldo_reservado <= saldo_actual) y (saldo_disponible <= saldo_total)
+--   · actualizado_en explícito eliminado: todos cubiertos por triggers fn_set_updated_at()
+--   · Validación de denominaciones duplicadas en registrar_arqueo
+-- ============================================================================================================================
+
+
+-- ============================================================================================================================
+-- 0. FUNCIÓN UTILITARIA DE AUDITORÍA
+--    Debe crearse PRIMERO — el resto de funciones depende de ella.
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION fn_registrar_auditoria(
+  p_id_usuario       BIGINT,
+  p_entidad_afectada VARCHAR,
+  p_id_registro      BIGINT,
+  p_accion           VARCHAR,
+  p_datos_anteriores JSONB   DEFAULT NULL,
+  p_datos_nuevos     JSONB   DEFAULT NULL,
+  p_id_sesion        BIGINT  DEFAULT NULL,
+  p_ip_origen        INET    DEFAULT NULL,
+  p_endpoint_api     TEXT    DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+
+  -- Validar acción contra el CHECK real de aud_log_operaciones
+  IF p_accion NOT IN ('INSERCION', 'ACTUALIZACION', 'ELIMINACION', 'LECTURA_SENSIBLE') THEN
+    RAISE EXCEPTION
+      '[fn_registrar_auditoria] Acción inválida: %. Valores permitidos: INSERCION, ACTUALIZACION, ELIMINACION, LECTURA_SENSIBLE',
+      p_accion;
+  END IF;
+
+  IF p_id_usuario IS NULL THEN
+    RAISE EXCEPTION '[fn_registrar_auditoria] p_id_usuario no puede ser NULL';
+  END IF;
+
+  IF p_entidad_afectada IS NULL OR trim(p_entidad_afectada) = '' THEN
+    RAISE EXCEPTION '[fn_registrar_auditoria] p_entidad_afectada no puede ser NULL o vacío';
+  END IF;
+
+  IF p_id_registro IS NULL THEN
+    RAISE EXCEPTION '[fn_registrar_auditoria] p_id_registro no puede ser NULL';
+  END IF;
+
+  INSERT INTO aud_log_operaciones (
+    id_usuario,
+    id_sesion,
+    entidad_afectada,
+    id_registro_afectado,
+    accion,
+    datos_anteriores,
+    datos_nuevos,
+    ip_origen,
+    endpoint_api
+  ) VALUES (
+    p_id_usuario,
+    p_id_sesion,
+    p_entidad_afectada,
+    p_id_registro,
+    p_accion,
+    p_datos_anteriores,
+    p_datos_nuevos,
+    p_ip_origen,
+    p_endpoint_api
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE EXCEPTION
+      '[fn_registrar_auditoria] Error al registrar auditoría en % (id: %): %',
+      p_entidad_afectada, p_id_registro, SQLERRM;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION fn_registrar_auditoria FROM PUBLIC;
+-- GRANT EXECUTE ON FUNCTION fn_registrar_auditoria TO rol_backend;
+
+
+-- ============================================================================================================================
+-- 1. ABRIR SESIÓN DE CAJA
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION abrir_sesion_caja(
+  p_id_caja        BIGINT,
+  p_id_usuario     BIGINT,
+  p_monto_apertura NUMERIC,
+  p_ip_origen      INET,
+  p_notas_apertura TEXT    DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora              TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_estado_abierta     BIGINT;
+  v_estado_caja_actual BIGINT;
+  v_caja_activa        BOOLEAN;
+  v_sesion_activa      BIGINT;
+  v_nueva_sesion_id    BIGINT;
+  v_saldo_existe       BIGINT;
+BEGIN
+
+  -- 1. Lock sobre la caja para evitar race condition
+  SELECT id_estado_caja, activo
+  INTO   v_estado_caja_actual, v_caja_activa
+  FROM   suc_cajas
+  WHERE  id = p_id_caja
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'La caja con id % no existe', p_id_caja;
+  END IF;
+
+  IF NOT v_caja_activa THEN
+    RAISE EXCEPTION 'La caja con id % está inactiva', p_id_caja;
+  END IF;
+
+  -- 2. Obtener estado ABIERTA con validación
+  SELECT id INTO v_estado_abierta
+  FROM   cfg_estados_caja
+  WHERE  codigo = 'ABIERTA' AND activo = TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: no existe estado ABIERTA en cfg_estados_caja';
+  END IF;
+
+  -- 3. Verificar que la caja no esté ya abierta
+  IF v_estado_caja_actual = v_estado_abierta THEN
+    RAISE EXCEPTION 'La caja % ya está abierta', p_id_caja;
+  END IF;
+
+  -- 4. Verificar sesión activa (el FOR UPDATE ya protege contra concurrencia)
+  SELECT id INTO v_sesion_activa
+  FROM   suc_sesiones_caja
+  WHERE  id_caja   = p_id_caja
+    AND  cierre_en IS NULL
+    AND  activo    = TRUE
+  LIMIT 1;
+
+  IF v_sesion_activa IS NOT NULL THEN
+    RAISE EXCEPTION 'Ya existe una sesión activa en esta caja (sesión id: %)', v_sesion_activa;
+  END IF;
+
+  -- 5. Verificar que el usuario esté activo y no bloqueado
+  IF NOT EXISTS (
+    SELECT 1 FROM usr_usuarios
+    WHERE  id        = p_id_usuario
+      AND  activo    = TRUE
+      AND  bloqueado = FALSE
+  ) THEN
+    RAISE EXCEPTION 'El usuario % no está disponible para operar', p_id_usuario;
+  END IF;
+
+  -- 6. Verificar asignación del usuario a esta caja
+  IF NOT EXISTS (
+    SELECT 1 FROM suc_asignaciones_caja
+    WHERE  id_caja           = p_id_caja
+      AND  id_usuario        = p_id_usuario
+      AND  asignacion_activa = TRUE
+      AND  fecha_inicio      <= CURRENT_DATE
+      AND  (fecha_fin IS NULL OR fecha_fin >= CURRENT_DATE)
+  ) THEN
+    RAISE EXCEPTION 'El usuario % no tiene asignación activa para la caja %',
+                    p_id_usuario, p_id_caja;
+  END IF;
+
+  -- 7. Crear la sesión
+  INSERT INTO suc_sesiones_caja (
+    id_caja,
+    id_usuario_apertura,
+    apertura_en,
+    monto_apertura,
+    notas_apertura,
+    activo,
+    creado_por
+  ) VALUES (
+    p_id_caja,
+    p_id_usuario,
+    v_ahora,
+    p_monto_apertura,
+    p_notas_apertura,
+    TRUE,
+    p_id_usuario
+  ) RETURNING id INTO v_nueva_sesion_id;
+
+  -- 8. Cambiar estado de la caja (trigger maneja actualizado_en)
+  UPDATE suc_cajas
+  SET    id_estado_caja = v_estado_abierta
+  WHERE  id = p_id_caja;
+
+  -- 9. Sincronizar saldo inicial en tes_saldos_caja
+  SELECT id INTO v_saldo_existe
+  FROM   tes_saldos_caja
+  WHERE  id_caja   = p_id_caja
+    AND  id_moneda = (SELECT id FROM cfg_monedas WHERE es_moneda_base = TRUE LIMIT 1);
+
+  IF v_saldo_existe IS NOT NULL THEN
+    UPDATE tes_saldos_caja
+    SET    saldo_actual          = p_monto_apertura,
+           saldo_reservado       = 0,
+           id_ultima_transaccion = NULL,
+           ultima_actualizacion  = v_ahora
+    WHERE  id = v_saldo_existe;
+  ELSE
+    INSERT INTO tes_saldos_caja (id_caja, id_moneda, saldo_actual, saldo_reservado, ultima_actualizacion)
+    SELECT p_id_caja, id, p_monto_apertura, 0, v_ahora
+    FROM   cfg_monedas WHERE es_moneda_base = TRUE LIMIT 1;
+  END IF;
+
+  -- 10. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_usuario,
+    p_id_sesion        => v_nueva_sesion_id,
+    p_entidad_afectada => 'suc_sesiones_caja',
+    p_id_registro      => v_nueva_sesion_id,
+    p_accion           => 'INSERCION',
+    p_datos_nuevos     => jsonb_build_object(
+                            'accion',         'apertura_caja',
+                            'id_caja',        p_id_caja,
+                            'monto_apertura', p_monto_apertura,
+                            'notas_apertura', p_notas_apertura,
+                            'apertura_en',    v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_sesion',      v_nueva_sesion_id,
+    'id_caja',        p_id_caja,
+    'monto_apertura', p_monto_apertura,
+    'abierta_en',     v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 2. APROBAR SOLICITUD DE FONDOS
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION aprobar_solicitud_fondos(
+  p_id_solicitud   BIGINT,
+  p_id_aprobador   BIGINT,
+  p_decision       VARCHAR,
+  p_monto_aprobado NUMERIC  DEFAULT NULL,
+  p_motivo         TEXT     DEFAULT NULL,
+  p_ip_origen      INET     DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora            TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_solicitud        RECORD;
+  v_id_estado_actual BIGINT;
+  v_id_estado_nuevo  BIGINT;
+  v_monto_final      NUMERIC;
+BEGIN
+
+  -- 1. Validar parámetro de decisión primero
+  IF p_decision NOT IN ('APROBADA', 'RECHAZADA') THEN
+    RAISE EXCEPTION 'Decisión inválida: %. Use APROBADA o RECHAZADA', p_decision;
+  END IF;
+
+  -- 2. Lock sobre la solicitud para evitar doble aprobación
+  SELECT tsf.id,
+         tsf.id_estado,
+         tsf.id_usuario_solicitante,
+         tsf.id_sucursal_solicitante,
+         tsf.id_sucursal_proveedora,
+         tsf.monto_solicitado,
+         tsf.id_moneda
+  INTO   v_solicitud
+  FROM   tes_solicitudes_fondos tsf
+  WHERE  tsf.id = p_id_solicitud
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Solicitud de fondos % no encontrada', p_id_solicitud;
+  END IF;
+
+  -- 3. Obtener id del estado PENDIENTE
+  SELECT id INTO v_id_estado_actual
+  FROM   cfg_estados_transaccion
+  WHERE  codigo = 'PENDIENTE' AND activo = TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado PENDIENTE no existe';
+  END IF;
+
+  -- 4. Verificar estado PENDIENTE
+  IF v_solicitud.id_estado != v_id_estado_actual THEN
+    RAISE EXCEPTION 'La solicitud % no está en estado PENDIENTE (id_estado actual: %)',
+                    p_id_solicitud, v_solicitud.id_estado;
+  END IF;
+
+  -- 5. Resolver id del estado destino
+  SELECT id INTO v_id_estado_nuevo
+  FROM   cfg_estados_transaccion
+  WHERE  codigo = p_decision AND activo = TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Estado % no existe en cfg_estados_transaccion', p_decision;
+  END IF;
+
+  -- 6. Validar permisos del aprobador
+  IF NOT EXISTS (
+    SELECT 1
+    FROM   usr_usuarios u
+    JOIN   usr_roles    r ON r.id = u.id_rol
+    WHERE  u.id            = p_id_aprobador
+      AND  u.activo        = TRUE
+      AND  u.bloqueado     = FALSE
+      AND  r.puede_aprobar = TRUE
+  ) THEN
+    RAISE EXCEPTION 'El usuario % no tiene permisos de aprobación o está inactivo', p_id_aprobador;
+  END IF;
+
+  -- 7. Validaciones específicas para APROBADA
+  IF p_decision = 'APROBADA' THEN
+    IF p_monto_aprobado IS NOT NULL AND p_monto_aprobado <= 0 THEN
+      RAISE EXCEPTION 'monto_aprobado debe ser mayor a cero';
+    END IF;
+    IF v_solicitud.id_sucursal_proveedora IS NULL THEN
+      RAISE EXCEPTION 'No se puede aprobar la solicitud % sin una sucursal proveedora asignada',
+                      p_id_solicitud;
+    END IF;
+    v_monto_final := COALESCE(p_monto_aprobado, v_solicitud.monto_solicitado);
+  ELSE
+    v_monto_final := NULL;
+  END IF;
+
+  -- 8. Actualizar la solicitud (trigger maneja actualizado_en)
+  UPDATE tes_solicitudes_fondos
+  SET    id_estado      = v_id_estado_nuevo,
+         monto_aprobado = v_monto_final,
+         notas          = COALESCE(p_motivo, notas),
+         id_aprobador   = p_id_aprobador,
+         aprobado_en    = v_ahora
+  WHERE  id = p_id_solicitud;
+
+  -- 9. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_aprobador,
+    p_entidad_afectada => 'tes_solicitudes_fondos',
+    p_id_registro      => p_id_solicitud,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('id_estado', v_solicitud.id_estado),
+    p_datos_nuevos     => jsonb_build_object(
+                            'decision',        p_decision,
+                            'id_estado_nuevo', v_id_estado_nuevo,
+                            'monto_aprobado',  v_monto_final,
+                            'aprobado_en',     v_ahora,
+                            'motivo',          p_motivo
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_solicitud',   p_id_solicitud,
+    'estado',         p_decision,
+    'monto_aprobado', v_monto_final,
+    'aprobado_en',    v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 3. APROBAR TRANSACCIÓN
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION aprobar_transaccion(
+  p_id_transaccion BIGINT,
+  p_id_aprobador   BIGINT,
+  p_decision       VARCHAR,
+  p_motivo         TEXT    DEFAULT NULL,
+  p_ip_origen      INET    DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora             TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_txn               RECORD;
+  v_estado_pendiente  BIGINT;
+  v_estado_nuevo      BIGINT;
+  v_codigo_nuevo      VARCHAR;
+BEGIN
+
+  -- 1. Validar p_decision primero
+  IF p_decision NOT IN ('APROBADA', 'RECHAZADA') THEN
+    RAISE EXCEPTION 'Decisión inválida: %. Use APROBADA o RECHAZADA', p_decision;
+  END IF;
+
+  -- 2. Motivo obligatorio al rechazar
+  IF p_decision = 'RECHAZADA' AND (p_motivo IS NULL OR trim(p_motivo) = '') THEN
+    RAISE EXCEPTION 'El motivo es obligatorio al rechazar una transacción';
+  END IF;
+
+  -- 3. Verificar permisos del aprobador
+  IF NOT EXISTS (
+    SELECT 1
+    FROM   usr_usuarios u
+    JOIN   usr_roles    r ON r.id = u.id_rol
+    WHERE  u.id            = p_id_aprobador
+      AND  u.activo        = TRUE
+      AND  u.bloqueado     = FALSE
+      AND  r.puede_aprobar = TRUE
+  ) THEN
+    RAISE EXCEPTION 'El usuario % no tiene permisos de aprobación o está inactivo', p_id_aprobador;
+  END IF;
+
+  -- 4. Obtener estados del catálogo con validación
+  SELECT id INTO v_estado_pendiente
+  FROM   cfg_estados_transaccion WHERE codigo = 'PENDIENTE' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado PENDIENTE no existe';
+  END IF;
+
+  SELECT id, codigo INTO v_estado_nuevo, v_codigo_nuevo
+  FROM   cfg_estados_transaccion WHERE codigo = p_decision AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado % no existe', p_decision;
+  END IF;
+
+  -- 5. Lock sobre la transacción
+  SELECT t.id_estado,
+         t.id_sesion_caja,
+         t.id_moneda,
+         t.monto,
+         t.monto_moneda_base
+  INTO   v_txn
+  FROM   mov_transacciones t
+  WHERE  t.id = p_id_transaccion AND t.activo = TRUE
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Transacción % no encontrada o inactiva', p_id_transaccion;
+  END IF;
+
+  -- 6. Verificar estado PENDIENTE
+  IF v_txn.id_estado != v_estado_pendiente THEN
+    RAISE EXCEPTION 'La transacción % no está en estado PENDIENTE (id_estado actual: %)',
+                    p_id_transaccion, v_txn.id_estado;
+  END IF;
+
+  -- 7. Registrar la decisión en mov_aprobaciones
+  INSERT INTO mov_aprobaciones (
+    id_transaccion, id_aprobador, accion, comentarios, nivel_aprobacion, accion_en
+  ) VALUES (
+    p_id_transaccion, p_id_aprobador, p_decision, p_motivo, 1, v_ahora
+  );
+
+  -- 8. Rama APROBADA
+  IF p_decision = 'APROBADA' THEN
+    UPDATE mov_transacciones
+    SET    aprobado_por = p_id_aprobador,
+           aprobado_en  = v_ahora
+    WHERE  id = p_id_transaccion;
+
+    BEGIN
+      PERFORM fn_completar_transaccion(p_id_transaccion, p_id_aprobador, p_ip_origen);
+    EXCEPTION WHEN OTHERS THEN
+      RAISE EXCEPTION 'Error al completar la transacción %: %', p_id_transaccion, SQLERRM;
+    END;
+
+  -- 9. Rama RECHAZADA
+  ELSIF p_decision = 'RECHAZADA' THEN
+    UPDATE mov_transacciones
+    SET    id_estado = v_estado_nuevo
+    WHERE  id = p_id_transaccion;
+
+    -- Liberar reserva usando monto_moneda_base
+    UPDATE tes_saldos_caja
+    SET    saldo_reservado       = GREATEST(saldo_reservado - v_txn.monto_moneda_base, 0),
+           ultima_actualizacion  = v_ahora
+    WHERE  id_caja   = (SELECT id_caja FROM suc_sesiones_caja WHERE id = v_txn.id_sesion_caja)
+      AND  id_moneda = v_txn.id_moneda;
+  END IF;
+
+  -- 10. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_aprobador,
+    p_entidad_afectada => 'mov_transacciones',
+    p_id_registro      => p_id_transaccion,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('id_estado', v_txn.id_estado),
+    p_datos_nuevos     => jsonb_build_object(
+                            'decision',    p_decision,
+                            'id_estado',   v_estado_nuevo,
+                            'aprobado_en', v_ahora,
+                            'motivo',      p_motivo
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_transaccion', p_id_transaccion,
+    'decision',       p_decision,
+    'nuevo_estado',   v_codigo_nuevo,
+    'aprobado_en',    v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 4. CERRAR SESIÓN DE CAJA
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION cerrar_sesion_caja(
+  p_id_sesion    BIGINT,
+  p_id_usuario   BIGINT,
+  p_monto_cierre NUMERIC,
+  p_notas_cierre TEXT    DEFAULT NULL,
+  p_ip_origen    INET    DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora           TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_estado_cerrada  BIGINT;
+  v_sesion          RECORD;
+  v_saldo_sistema   NUMERIC;
+  v_diferencia      NUMERIC;
+  v_umbral_amarillo NUMERIC;
+  v_umbral_rojo     NUMERIC;
+  v_id_alerta       BIGINT;
+BEGIN
+
+  -- 1. Obtener estado CERRADA con validación
+  SELECT id INTO v_estado_cerrada
+  FROM   cfg_estados_caja WHERE codigo = 'CERRADA' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado CERRADA no existe en cfg_estados_caja';
+  END IF;
+
+  -- 2. Lock sobre la sesión
+  SELECT sc.id, sc.id_caja, sc.cierre_en, sc.id_usuario_apertura, sc.activo
+  INTO   v_sesion
+  FROM   suc_sesiones_caja sc
+  WHERE  sc.id = p_id_sesion
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Sesión % no encontrada', p_id_sesion;
+  END IF;
+
+  IF NOT v_sesion.activo THEN
+    RAISE EXCEPTION 'La sesión % ya está inactiva', p_id_sesion;
+  END IF;
+
+  IF v_sesion.cierre_en IS NOT NULL THEN
+    RAISE EXCEPTION 'La sesión % ya fue cerrada en %', p_id_sesion, v_sesion.cierre_en;
+  END IF;
+
+  -- 3. Verificar permiso para cerrar (cajero propio o supervisor)
+  IF v_sesion.id_usuario_apertura != p_id_usuario THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM   usr_usuarios u JOIN usr_roles r ON r.id = u.id_rol
+      WHERE  u.id = p_id_usuario AND u.activo = TRUE
+        AND  u.bloqueado = FALSE AND r.puede_aprobar = TRUE
+    ) THEN
+      RAISE EXCEPTION 'El usuario % no tiene permiso para cerrar la sesión %',
+                      p_id_usuario, p_id_sesion;
+    END IF;
+  END IF;
+
+  -- 4. Bloquear cierre si hay transacciones PENDIENTES
+  IF EXISTS (
+    SELECT 1
+    FROM   mov_transacciones mt
+    JOIN   cfg_estados_transaccion et ON et.id = mt.id_estado
+    WHERE  mt.id_sesion_caja = p_id_sesion
+      AND  et.codigo = 'PENDIENTE' AND mt.activo = TRUE
+  ) THEN
+    RAISE EXCEPTION 'Existen transacciones PENDIENTES en la sesión %. Resuélvelas antes de cerrar.',
+                    p_id_sesion;
+  END IF;
+
+  -- 5. Saldo del sistema y umbrales desde la configuración real de la caja
+  SELECT COALESCE(tsc.saldo_actual, 0)
+  INTO   v_saldo_sistema
+  FROM   tes_saldos_caja tsc
+  JOIN   cfg_monedas     m ON m.id = tsc.id_moneda
+  WHERE  tsc.id_caja = v_sesion.id_caja AND m.es_moneda_base = TRUE
+  LIMIT  1;
+
+  SELECT efectivo_min_permitido, efectivo_max_permitido
+  INTO   v_umbral_amarillo, v_umbral_rojo
+  FROM   suc_cajas WHERE id = v_sesion.id_caja;
+
+  v_diferencia := p_monto_cierre - v_saldo_sistema;
+
+  -- 6. Cerrar la sesión (trigger maneja actualizado_en)
+  UPDATE suc_sesiones_caja
+  SET    id_estado_al_cierre = v_estado_cerrada,
+         id_usuario_cierre   = p_id_usuario,
+         cierre_en           = v_ahora,
+         monto_cierre        = p_monto_cierre,
+         diferencia          = v_diferencia,
+         notas_cierre        = p_notas_cierre,
+         activo              = FALSE
+  WHERE  id = p_id_sesion;
+
+  -- 7. Cambiar estado de la caja (trigger maneja actualizado_en)
+  UPDATE suc_cajas SET id_estado_caja = v_estado_cerrada WHERE id = v_sesion.id_caja;
+
+  -- 8. Alerta si la diferencia supera umbrales configurados
+  IF ABS(v_diferencia) > v_umbral_amarillo THEN
+    INSERT INTO mov_alertas (id_caja, tipo_alerta, nivel_criticidad, mensaje, resuelta)
+    VALUES (
+      v_sesion.id_caja,
+      'DESBALANCE',
+      CASE WHEN ABS(v_diferencia) > v_umbral_rojo THEN 'ROJO' ELSE 'AMARILLO' END,
+      format('Cierre sesión %s — diferencia: %s | Sistema: %s | Físico: %s',
+             p_id_sesion, v_diferencia, v_saldo_sistema, p_monto_cierre),
+      FALSE
+    ) RETURNING id INTO v_id_alerta;
+  END IF;
+
+  -- 9. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_usuario,
+    p_entidad_afectada => 'suc_sesiones_caja',
+    p_id_registro      => p_id_sesion,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('cierre_en', NULL, 'activo', TRUE),
+    p_datos_nuevos     => jsonb_build_object(
+                            'accion',       'cierre_caja',
+                            'monto_cierre', p_monto_cierre,
+                            'diferencia',   v_diferencia,
+                            'cierre_en',    v_ahora,
+                            'id_alerta',    v_id_alerta
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_sesion',       p_id_sesion,
+    'monto_sistema',   v_saldo_sistema,
+    'monto_cierre',    p_monto_cierre,
+    'diferencia',      v_diferencia,
+    'cierre_en',       v_ahora,
+    'alerta_generada', v_id_alerta IS NOT NULL,
+    'id_alerta',       v_id_alerta
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 5. COMPLETAR TRANSACCIÓN (motor de saldos interno)
+--    CAMBIO FINAL: UPDATE de saldo_actual y saldo_reservado en el MISMO statement
+--    para respetar CHECK (saldo_reservado <= saldo_actual) de tes_saldos_caja
+--    y CHECK (saldo_disponible <= saldo_total) de tes_saldos_sucursal.
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION fn_completar_transaccion(
+  p_id_transaccion BIGINT,
+  p_id_aprobador   BIGINT,
+  p_ip_origen      INET    DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora             TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_txn               RECORD;
+  v_tipo_codigo       VARCHAR;
+  v_estado_completada BIGINT;
+  v_saldo_disponible  NUMERIC;
+BEGIN
+
+  -- 1. Resolver estado COMPLETADA
+  SELECT id INTO v_estado_completada
+  FROM   cfg_estados_transaccion WHERE codigo = 'COMPLETADA' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado COMPLETADA no existe';
+  END IF;
+
+  -- 2. Lock sobre la transacción
+  SELECT t.id_estado,
+         t.id_tipo_transaccion,
+         t.id_caja_origen,
+         t.id_caja_destino,
+         t.id_sucursal_origen,
+         t.id_sucursal_destino,
+         t.id_moneda,
+         t.monto,
+         t.monto_moneda_base
+  INTO   v_txn
+  FROM   mov_transacciones t
+  WHERE  t.id = p_id_transaccion
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Transacción % no encontrada', p_id_transaccion;
+  END IF;
+
+  -- 3. Verificar estado previo válido
+  IF NOT EXISTS (
+    SELECT 1 FROM cfg_estados_transaccion
+    WHERE  id = v_txn.id_estado AND codigo IN ('PENDIENTE', 'APROBADA')
+  ) THEN
+    RAISE EXCEPTION 'La transacción % no puede completarse desde su estado actual (id_estado: %)',
+                    p_id_transaccion, v_txn.id_estado;
+  END IF;
+
+  -- 4. Obtener código del tipo de transacción
+  SELECT codigo INTO v_tipo_codigo
+  FROM   cfg_tipos_transaccion WHERE id = v_txn.id_tipo_transaccion;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Tipo de transacción % no encontrado', v_txn.id_tipo_transaccion;
+  END IF;
+
+  -- 5. Actualizar estado a COMPLETADA
+  UPDATE mov_transacciones SET id_estado = v_estado_completada WHERE id = p_id_transaccion;
+
+  -- ── SALIDAS: RET, TRF, REM_O ────────────────────────────────────────────
+  IF v_tipo_codigo IN ('RET', 'TRF', 'REM_O') THEN
+
+    -- Verificar saldo suficiente
+    SELECT (saldo_actual - saldo_reservado) INTO v_saldo_disponible
+    FROM   tes_saldos_caja
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda
+    FOR UPDATE;
+
+    IF COALESCE(v_saldo_disponible, 0) < v_txn.monto_moneda_base THEN
+      RAISE EXCEPTION 'Saldo insuficiente en caja % — disponible: %, requerido: %',
+                      v_txn.id_caja_origen, COALESCE(v_saldo_disponible, 0), v_txn.monto_moneda_base;
+    END IF;
+
+    -- CAMBIO CLAVE: saldo_actual y saldo_reservado en el MISMO UPDATE
+    -- PostgreSQL evalúa el CHECK al final del statement → constraint siempre se cumple
+    UPDATE tes_saldos_caja
+    SET    saldo_actual          = saldo_actual - v_txn.monto_moneda_base,
+           saldo_reservado       = GREATEST(saldo_reservado - v_txn.monto_moneda_base, 0),
+           id_ultima_transaccion = p_id_transaccion,
+           ultima_actualizacion  = v_ahora
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda;
+
+    -- CAMBIO CLAVE: saldo_total y saldo_disponible en el MISMO UPDATE
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total           = saldo_total - v_txn.monto_moneda_base,
+           saldo_disponible      = saldo_disponible - v_txn.monto_moneda_base,
+           ultima_actualizacion  = v_ahora
+    WHERE  id_sucursal = v_txn.id_sucursal_origen AND id_moneda = v_txn.id_moneda;
+
+  END IF;
+
+  -- ── ENTRADAS: DEP, REM_I, RPLN ─────────────────────────────────────────
+  IF v_tipo_codigo IN ('DEP', 'REM_I', 'RPLN') THEN
+
+    PERFORM id FROM tes_saldos_caja
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda
+    FOR UPDATE;
+
+    UPDATE tes_saldos_caja
+    SET    saldo_actual          = saldo_actual + v_txn.monto_moneda_base,
+           id_ultima_transaccion = p_id_transaccion,
+           ultima_actualizacion  = v_ahora
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda;
+
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total          = saldo_total + v_txn.monto_moneda_base,
+           saldo_disponible     = saldo_disponible + v_txn.monto_moneda_base,
+           ultima_actualizacion = v_ahora
+    WHERE  id_sucursal = v_txn.id_sucursal_origen AND id_moneda = v_txn.id_moneda;
+
+  END IF;
+
+  -- ── TRF: acreditar caja y sucursal destino ─────────────────────────────
+  IF v_tipo_codigo = 'TRF' AND v_txn.id_caja_destino IS NOT NULL THEN
+
+    PERFORM id FROM tes_saldos_caja
+    WHERE  id_caja = v_txn.id_caja_destino AND id_moneda = v_txn.id_moneda
+    FOR UPDATE;
+
+    UPDATE tes_saldos_caja
+    SET    saldo_actual          = saldo_actual + v_txn.monto_moneda_base,
+           id_ultima_transaccion = p_id_transaccion,
+           ultima_actualizacion  = v_ahora
+    WHERE  id_caja = v_txn.id_caja_destino AND id_moneda = v_txn.id_moneda;
+
+    IF v_txn.id_sucursal_destino IS NOT NULL
+       AND v_txn.id_sucursal_destino != v_txn.id_sucursal_origen THEN
+      UPDATE tes_saldos_sucursal
+      SET    saldo_total          = saldo_total + v_txn.monto_moneda_base,
+             saldo_disponible     = saldo_disponible + v_txn.monto_moneda_base,
+             ultima_actualizacion = v_ahora
+      WHERE  id_sucursal = v_txn.id_sucursal_destino AND id_moneda = v_txn.id_moneda;
+    END IF;
+
+  END IF;
+
+  -- 6. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_aprobador,
+    p_entidad_afectada => 'mov_transacciones',
+    p_id_registro      => p_id_transaccion,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('id_estado', v_txn.id_estado),
+    p_datos_nuevos     => jsonb_build_object(
+                            'id_estado',     v_estado_completada,
+                            'tipo',          v_tipo_codigo,
+                            'monto',         v_txn.monto_moneda_base,
+                            'completada_en', v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 6. ACTUALIZAR ESTADO DE REMESA
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION actualizar_estado_remesa(
+  p_id_remesa      BIGINT,
+  p_id_usuario     BIGINT,
+  p_nuevo_estado   VARCHAR,
+  p_numero_guia    VARCHAR  DEFAULT NULL,
+  p_numero_sello   VARCHAR  DEFAULT NULL,
+  p_monto_recibido NUMERIC  DEFAULT NULL,
+  p_ip_origen      INET     DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora                TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_remesa               RECORD;
+  v_codigo_estado_actual VARCHAR;
+  v_id_estado_nuevo      BIGINT;
+  v_monto_usar           NUMERIC;
+  v_diferencia           NUMERIC;
+BEGIN
+
+  -- 1. Validar transición solicitada
+  IF p_nuevo_estado NOT IN ('EN_TRANSITO', 'ENTREGADA', 'CANCELADA') THEN
+    RAISE EXCEPTION 'Estado inválido: %. Use EN_TRANSITO, ENTREGADA o CANCELADA', p_nuevo_estado;
+  END IF;
+
+  -- 2. Lock sobre la remesa
+  SELECT r.id, r.id_estado, r.id_sucursal_origen, r.id_sucursal_destino,
+         r.id_moneda, r.monto_programado, r.monto_entregado,
+         r.id_usuario_autoriza, r.numero_guia, r.numero_sello
+  INTO   v_remesa
+  FROM   tes_remesas r WHERE r.id = p_id_remesa FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Remesa % no encontrada', p_id_remesa;
+  END IF;
+
+  -- 3. Resolver código del estado actual
+  SELECT codigo INTO v_codigo_estado_actual
+  FROM   cfg_estados_transaccion WHERE id = v_remesa.id_estado;
+
+  -- 4. Resolver id del estado destino
+  SELECT id INTO v_id_estado_nuevo
+  FROM   cfg_estados_transaccion WHERE codigo = p_nuevo_estado AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado % no existe', p_nuevo_estado;
+  END IF;
+
+  -- 5. Verificar permiso del usuario
+  IF v_remesa.id_usuario_autoriza != p_id_usuario THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM usr_usuarios u JOIN usr_roles r ON r.id = u.id_rol
+      WHERE  u.id = p_id_usuario AND u.activo = TRUE
+        AND  u.bloqueado = FALSE AND r.puede_aprobar = TRUE
+    ) THEN
+      RAISE EXCEPTION 'El usuario % no tiene permiso para actualizar el estado de la remesa %',
+                      p_id_usuario, p_id_remesa;
+    END IF;
+  END IF;
+
+  -- ── EN_TRANSITO ──────────────────────────────────────────────────────────
+  IF p_nuevo_estado = 'EN_TRANSITO' THEN
+    IF v_codigo_estado_actual != 'PROGRAMADA' THEN
+      RAISE EXCEPTION 'Solo se puede despachar una remesa PROGRAMADA (estado actual: %)',
+                      v_codigo_estado_actual;
+    END IF;
+
+    UPDATE tes_remesas
+    SET    id_estado    = v_id_estado_nuevo,
+           salida_en    = v_ahora,
+           numero_guia  = COALESCE(p_numero_guia,  numero_guia),
+           numero_sello = COALESCE(p_numero_sello, numero_sello)
+    WHERE  id = p_id_remesa;
+
+    -- CAMBIO CLAVE: saldo_total y saldo_disponible juntos
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total          = saldo_total - v_remesa.monto_programado,
+           saldo_disponible     = saldo_disponible - v_remesa.monto_programado,
+           ultima_actualizacion = v_ahora
+    WHERE  id_sucursal = v_remesa.id_sucursal_origen AND id_moneda = v_remesa.id_moneda;
+
+  -- ── ENTREGADA ─────────────────────────────────────────────────────────────
+  ELSIF p_nuevo_estado = 'ENTREGADA' THEN
+    IF v_codigo_estado_actual != 'EN_TRANSITO' THEN
+      RAISE EXCEPTION 'Solo se puede confirmar entrega de una remesa EN_TRANSITO (estado actual: %)',
+                      v_codigo_estado_actual;
+    END IF;
+
+    v_monto_usar := COALESCE(p_monto_recibido, v_remesa.monto_programado);
+    v_diferencia := v_monto_usar - v_remesa.monto_programado;
+
+    UPDATE tes_remesas
+    SET    id_estado       = v_id_estado_nuevo,
+           llegada_en      = v_ahora,
+           monto_entregado = v_monto_usar,
+           numero_sello    = COALESCE(p_numero_sello, numero_sello)
+    WHERE  id = p_id_remesa;
+
+    -- CAMBIO CLAVE: saldo_total y saldo_disponible juntos
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total          = saldo_total + v_monto_usar,
+           saldo_disponible     = saldo_disponible + v_monto_usar,
+           ultima_actualizacion = v_ahora
+    WHERE  id_sucursal = v_remesa.id_sucursal_destino AND id_moneda = v_remesa.id_moneda;
+
+    IF ABS(v_diferencia) > 0 THEN
+      INSERT INTO mov_alertas (id_sucursal, tipo_alerta, nivel_criticidad, mensaje, resuelta)
+      VALUES (
+        v_remesa.id_sucursal_destino, 'DESBALANCE',
+        CASE WHEN ABS(v_diferencia) > (v_remesa.monto_programado * 0.05) THEN 'ROJO' ELSE 'AMARILLO' END,
+        format('Diferencia en remesa #%s: programado %s, recibido %s, diferencia %s',
+               p_id_remesa, v_remesa.monto_programado, v_monto_usar, v_diferencia),
+        FALSE
+      );
+    END IF;
+
+    -- Resolver alertas FONDOS_BAJOS solo si el saldo resultante supera el mínimo
+    IF EXISTS (
+      SELECT 1
+      FROM   tes_saldos_sucursal tss
+      JOIN   suc_sucursales      ss ON ss.id = tss.id_sucursal
+      WHERE  tss.id_sucursal = v_remesa.id_sucursal_destino
+        AND  tss.id_moneda   = v_remesa.id_moneda
+        AND  tss.saldo_disponible >= ss.efectivo_min_permitido
+    ) THEN
+      UPDATE mov_alertas
+      SET    resuelta    = TRUE, resuelta_por = p_id_usuario, resuelta_en = v_ahora
+      WHERE  id_sucursal = v_remesa.id_sucursal_destino
+        AND  tipo_alerta = 'FONDOS_BAJOS' AND resuelta = FALSE;
+    END IF;
+
+  -- ── CANCELADA ─────────────────────────────────────────────────────────────
+  ELSIF p_nuevo_estado = 'CANCELADA' THEN
+    IF v_codigo_estado_actual NOT IN ('PROGRAMADA', 'EN_TRANSITO') THEN
+      RAISE EXCEPTION 'No se puede cancelar una remesa en estado %', v_codigo_estado_actual;
+    END IF;
+
+    UPDATE tes_remesas SET id_estado = v_id_estado_nuevo WHERE id = p_id_remesa;
+
+    IF v_codigo_estado_actual = 'EN_TRANSITO' THEN
+      -- CAMBIO CLAVE: saldo_total y saldo_disponible juntos
+      UPDATE tes_saldos_sucursal
+      SET    saldo_total          = saldo_total + v_remesa.monto_programado,
+             saldo_disponible     = saldo_disponible + v_remesa.monto_programado,
+             ultima_actualizacion = v_ahora
+      WHERE  id_sucursal = v_remesa.id_sucursal_origen AND id_moneda = v_remesa.id_moneda;
+    END IF;
+  END IF;
+
+  -- Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_usuario,
+    p_entidad_afectada => 'tes_remesas',
+    p_id_registro      => p_id_remesa,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('id_estado', v_remesa.id_estado, 'codigo_estado', v_codigo_estado_actual),
+    p_datos_nuevos     => jsonb_build_object(
+                            'nuevo_estado',   p_nuevo_estado,
+                            'id_estado_nuevo', v_id_estado_nuevo,
+                            'numero_guia',    p_numero_guia,
+                            'numero_sello',   p_numero_sello,
+                            'monto_recibido', p_monto_recibido,
+                            'actualizado_en', v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_remesa',        p_id_remesa,
+    'estado_anterior',  v_codigo_estado_actual,
+    'nuevo_estado',     p_nuevo_estado,
+    'monto_programado', v_remesa.monto_programado,
+    'monto_entregado',  CASE WHEN p_nuevo_estado = 'ENTREGADA' THEN v_monto_usar ELSE NULL END,
+    'diferencia',       CASE WHEN p_nuevo_estado = 'ENTREGADA' THEN v_diferencia ELSE NULL END,
+    'actualizado_en',   v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 7. REGISTRAR ARQUEO
+--    CAMBIO FINAL CRÍTICO: diferencia es GENERATED ALWAYS AS STORED → NO incluir en INSERT
+--    CAMBIO ADICIONAL: validación de denominaciones duplicadas en p_detalle
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION registrar_arqueo(
+  p_id_sesion_caja          BIGINT,
+  p_id_usuario              BIGINT,
+  p_tipo_arqueo             VARCHAR,
+  p_detalle                 JSONB,
+  p_justificacion_diferencia TEXT  DEFAULT NULL,
+  p_ip_origen               INET   DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora           TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_sesion          RECORD;
+  v_monto_sistema   NUMERIC;
+  v_total_fisico    NUMERIC     := 0;
+  v_diferencia      NUMERIC;
+  v_id_arqueo       BIGINT;
+  v_id_estado_ini   BIGINT;
+  v_item            JSONB;
+  v_id_denom        BIGINT;
+  v_cantidad        INT;
+  v_valor_denom     NUMERIC;
+  v_umbral_amarillo NUMERIC;
+  v_umbral_rojo     NUMERIC;
+BEGIN
+
+  -- 1. Validar tipo de arqueo
+  IF p_tipo_arqueo NOT IN ('PARCIAL', 'CIERRE', 'SORPRESA') THEN
+    RAISE EXCEPTION 'Tipo de arqueo inválido: %. Use PARCIAL, CIERRE o SORPRESA', p_tipo_arqueo;
+  END IF;
+
+  -- 2. Resolver estado inicial del arqueo
+  SELECT id INTO v_id_estado_ini
+  FROM   cfg_estados_transaccion WHERE codigo = 'PENDIENTE' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado PENDIENTE no existe';
+  END IF;
+
+  -- 3. Lock sobre la sesión
+  SELECT sc.id, sc.id_caja, sc.activo, sc.cierre_en,
+         c.id_sucursal, c.efectivo_min_permitido, c.efectivo_max_permitido
+  INTO   v_sesion
+  FROM   suc_sesiones_caja sc
+  JOIN   suc_cajas c ON c.id = sc.id_caja
+  WHERE  sc.id = p_id_sesion_caja
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Sesión de caja % no encontrada', p_id_sesion_caja;
+  END IF;
+
+  IF NOT v_sesion.activo OR v_sesion.cierre_en IS NOT NULL THEN
+    RAISE EXCEPTION 'La sesión % no está activa o ya fue cerrada', p_id_sesion_caja;
+  END IF;
+
+  v_umbral_amarillo := v_sesion.efectivo_min_permitido;
+  v_umbral_rojo     := v_sesion.efectivo_max_permitido;
+
+  -- 4. Saldo del sistema en moneda base
+  SELECT COALESCE(tsc.saldo_actual, 0) INTO v_monto_sistema
+  FROM   tes_saldos_caja tsc
+  JOIN   cfg_monedas     m ON m.id = tsc.id_moneda
+  WHERE  tsc.id_caja = v_sesion.id_caja AND m.es_moneda_base = TRUE
+  LIMIT  1;
+
+  -- 5. Validar detalle: denominaciones existentes, cantidades válidas y SIN DUPLICADOS
+  --    CAMBIO: verificar duplicados en el JSONB antes de procesar
+  IF (
+    SELECT COUNT(*) != COUNT(DISTINCT (value->>'id_denominacion'))
+    FROM   jsonb_array_elements(p_detalle)
+  ) THEN
+    RAISE EXCEPTION 'El detalle contiene denominaciones duplicadas — cada denominación debe aparecer una sola vez';
+  END IF;
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_detalle) AS value LOOP
+    v_id_denom := (v_item->>'id_denominacion')::BIGINT;
+    v_cantidad := (v_item->>'cantidad')::INT;
+
+    IF v_id_denom IS NULL OR v_cantidad IS NULL THEN
+      RAISE EXCEPTION 'Detalle malformado: cada item debe tener id_denominacion y cantidad';
+    END IF;
+
+    IF v_cantidad < 0 THEN
+      RAISE EXCEPTION 'La cantidad para la denominación % no puede ser negativa', v_id_denom;
+    END IF;
+
+    SELECT valor INTO v_valor_denom
+    FROM   cfg_denominaciones WHERE id = v_id_denom AND activo = TRUE;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Denominación % no encontrada o inactiva', v_id_denom;
+    END IF;
+
+    v_total_fisico := v_total_fisico + (v_valor_denom * v_cantidad);
+  END LOOP;
+
+  v_diferencia := v_total_fisico - v_monto_sistema;
+
+  -- 6. Insertar arqueo SIN el campo diferencia (es GENERATED ALWAYS AS STORED)
+  --    CAMBIO CRÍTICO: eliminar diferencia del INSERT
+  INSERT INTO suc_arqueos (
+    id_sesion_caja,
+    id_usuario_arqueo,
+    arqueo_en,
+    tipo_arqueo,
+    monto_sistema,
+    total_fisico,
+    -- diferencia ← OMITIDO: columna GENERATED ALWAYS AS (total_fisico - monto_sistema) STORED
+    justificacion_diferencia,
+    id_estado,
+    creado_por
+  ) VALUES (
+    p_id_sesion_caja,
+    p_id_usuario,
+    v_ahora,
+    p_tipo_arqueo,
+    v_monto_sistema,
+    v_total_fisico,
+    p_justificacion_diferencia,
+    v_id_estado_ini,
+    p_id_usuario
+  ) RETURNING id INTO v_id_arqueo;
+
+  -- 7. Insertar detalle (denominaciones ya validadas en el bucle anterior)
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_detalle) AS value LOOP
+    v_id_denom := (v_item->>'id_denominacion')::BIGINT;
+    v_cantidad := (v_item->>'cantidad')::INT;
+
+    SELECT valor INTO v_valor_denom FROM cfg_denominaciones WHERE id = v_id_denom;
+
+    INSERT INTO suc_arqueo_detalle (id_arqueo, id_denominacion, cantidad, subtotal)
+    VALUES (v_id_arqueo, v_id_denom, v_cantidad, v_valor_denom * v_cantidad);
+  END LOOP;
+
+  -- 8. Alerta con umbrales de la caja
+  IF ABS(v_diferencia) > v_umbral_amarillo THEN
+    INSERT INTO mov_alertas (id_sucursal, id_caja, tipo_alerta, nivel_criticidad, mensaje, resuelta)
+    VALUES (
+      v_sesion.id_sucursal, v_sesion.id_caja, 'DESBALANCE',
+      CASE WHEN ABS(v_diferencia) > v_umbral_rojo THEN 'ROJO' ELSE 'AMARILLO' END,
+      format('Arqueo %s — sesión %s | diferencia: %s | sistema: %s | físico: %s',
+             p_tipo_arqueo, p_id_sesion_caja, v_diferencia, v_monto_sistema, v_total_fisico),
+      FALSE
+    );
+  END IF;
+
+  -- 9. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_usuario,
+    p_entidad_afectada => 'suc_arqueos',
+    p_id_registro      => v_id_arqueo,
+    p_accion           => 'INSERCION',
+    p_datos_anteriores => NULL,
+    p_datos_nuevos     => jsonb_build_object(
+                            'tipo_arqueo',   p_tipo_arqueo,
+                            'monto_sistema', v_monto_sistema,
+                            'total_fisico',  v_total_fisico,
+                            'diferencia',    v_diferencia,
+                            'arqueo_en',     v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_arqueo',       v_id_arqueo,
+    'monto_sistema',   v_monto_sistema,
+    'total_fisico',    v_total_fisico,
+    'diferencia',      v_diferencia,
+    'alerta_generada', ABS(v_diferencia) > v_umbral_amarillo,
+    'arqueo_en',       v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 8. CREAR TRANSACCIÓN (punto de entrada del sistema)
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION crear_transaccion(
+  p_id_sesion_caja             BIGINT,
+  p_id_tipo_transaccion        BIGINT,
+  p_id_moneda                  BIGINT,
+  p_monto                      NUMERIC,
+  p_nombre_cliente             TEXT,
+  p_tipo_instrumento           VARCHAR,
+  p_canal                      VARCHAR,
+  p_creado_por                 BIGINT,
+  p_ip_origen                  INET     DEFAULT NULL,
+  p_descripcion                TEXT     DEFAULT NULL,
+  p_numero_cheque              VARCHAR  DEFAULT NULL,
+  p_numero_cuenta_enmascarado  VARCHAR  DEFAULT NULL,
+  p_id_caja_destino            BIGINT   DEFAULT NULL,
+  p_id_sucursal_destino        BIGINT   DEFAULT NULL,
+  p_tasa_cambio                NUMERIC  DEFAULT 1.000000
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora               TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_sesion              RECORD;
+  v_tipo_txn            RECORD;
+  v_limite_usuario      RECORD;
+  v_estado_pendiente    BIGINT;
+  v_estado_completada   BIGINT;
+  v_saldo_disponible    NUMERIC;
+  v_monto_diario_usado  NUMERIC;
+  v_numero_referencia   VARCHAR;
+  v_id_transaccion      BIGINT;
+  v_id_caja_origen      BIGINT;
+  v_id_sucursal_origen  BIGINT;
+  v_requiere_aprobacion BOOLEAN;
+  v_monto_base          NUMERIC;
+  v_id_estado_txn       BIGINT;
+BEGIN
+
+  -- 1. Validaciones de parámetros CHECK antes de tocar la BD
+  IF p_tipo_instrumento NOT IN ('EFECTIVO', 'CHEQUE', 'TRANSFERENCIA_ELECTRONICA') THEN
+    RAISE EXCEPTION 'tipo_instrumento inválido: %. Use EFECTIVO, CHEQUE o TRANSFERENCIA_ELECTRONICA',
+                    p_tipo_instrumento;
+  END IF;
+
+  IF p_canal NOT IN ('WEB', 'API', 'CORE_BANCARIO', 'MOVIL') THEN
+    RAISE EXCEPTION 'canal inválido: %. Use WEB, API, CORE_BANCARIO o MOVIL', p_canal;
+  END IF;
+
+  IF p_monto <= 0 THEN
+    RAISE EXCEPTION 'El monto debe ser mayor a cero';
+  END IF;
+
+  -- 2. Resolver estados del catálogo con validación
+  SELECT id INTO v_estado_pendiente
+  FROM   cfg_estados_transaccion WHERE codigo = 'PENDIENTE' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado PENDIENTE no existe';
+  END IF;
+
+  SELECT id INTO v_estado_completada
+  FROM   cfg_estados_transaccion WHERE codigo = 'COMPLETADA' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado COMPLETADA no existe';
+  END IF;
+
+  -- 3. Configuración del tipo de transacción
+  SELECT * INTO v_tipo_txn
+  FROM   cfg_tipos_transaccion WHERE id = p_id_tipo_transaccion AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Tipo de transacción % no válido o inactivo', p_id_tipo_transaccion;
+  END IF;
+
+  -- 4. Lock sobre saldo de la caja antes de cualquier validación
+  PERFORM tsc.id
+  FROM    tes_saldos_caja tsc
+  WHERE   tsc.id_caja   = (SELECT id_caja FROM suc_sesiones_caja WHERE id = p_id_sesion_caja)
+    AND   tsc.id_moneda = p_id_moneda
+  FOR UPDATE;
+
+  -- 5. Validar sesión activa (columna real: cierre_en)
+  SELECT sc.id, sc.id_caja, sc.cierre_en, sc.activo,
+         c.id_sucursal, c.efectivo_min_permitido, c.efectivo_max_permitido
+  INTO   v_sesion
+  FROM   suc_sesiones_caja sc
+  JOIN   suc_cajas c ON c.id = sc.id_caja
+  WHERE  sc.id       = p_id_sesion_caja
+    AND  sc.cierre_en IS NULL
+    AND  sc.activo   = TRUE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No existe una sesión de caja activa con id %', p_id_sesion_caja;
+  END IF;
+
+  v_id_caja_origen     := v_sesion.id_caja;
+  v_id_sucursal_origen := v_sesion.id_sucursal;
+
+  -- 6. Validar saldo para SALIDAS (RPLN es entrada — no se incluye)
+  IF v_tipo_txn.codigo IN ('RET', 'TRF', 'REM_O') THEN
+    SELECT (saldo_actual - saldo_reservado) INTO v_saldo_disponible
+    FROM   tes_saldos_caja
+    WHERE  id_caja = v_id_caja_origen AND id_moneda = p_id_moneda;
+
+    IF COALESCE(v_saldo_disponible, 0) < p_monto THEN
+      RAISE EXCEPTION 'Saldo insuficiente. Disponible: %, Requerido: %',
+                      COALESCE(v_saldo_disponible, 0), p_monto;
+    END IF;
+  END IF;
+
+  -- 7. Validar límites del usuario (columnas reales de mov_limites_usuario)
+  SELECT lu.monto_max_individual, lu.monto_max_diario, lu.umbral_doble_aprobacion
+  INTO   v_limite_usuario
+  FROM   mov_limites_usuario lu
+  WHERE  lu.id_usuario          = p_creado_por
+    AND  lu.id_tipo_transaccion = p_id_tipo_transaccion
+    AND  lu.activo              = TRUE
+  LIMIT  1;
+
+  IF FOUND THEN
+    IF p_monto > v_limite_usuario.monto_max_individual THEN
+      RAISE EXCEPTION 'Monto supera el límite individual del usuario: %',
+                      v_limite_usuario.monto_max_individual;
+    END IF;
+
+    SELECT COALESCE(SUM(t.monto_moneda_base), 0) INTO v_monto_diario_usado
+    FROM   mov_transacciones t
+    JOIN   cfg_estados_transaccion e ON e.id = t.id_estado
+    WHERE  t.creado_por          = p_creado_por
+      AND  t.id_tipo_transaccion = p_id_tipo_transaccion
+      AND  t.fecha_valor         = CURRENT_DATE
+      AND  e.codigo NOT IN ('RECHAZADA', 'CANCELADA')
+      AND  t.activo              = TRUE;
+
+    IF (v_monto_diario_usado + p_monto) > v_limite_usuario.monto_max_diario THEN
+      RAISE EXCEPTION 'Monto supera el límite diario del usuario. Usado: %, Límite: %',
+                      v_monto_diario_usado, v_limite_usuario.monto_max_diario;
+    END IF;
+
+    v_requiere_aprobacion := CASE
+      WHEN p_monto >= v_limite_usuario.umbral_doble_aprobacion THEN TRUE
+      ELSE v_tipo_txn.requiere_aprobacion
+    END;
+  ELSE
+    IF v_tipo_txn.monto_limite_defecto IS NOT NULL AND p_monto > v_tipo_txn.monto_limite_defecto THEN
+      RAISE EXCEPTION 'Monto supera el límite del tipo de transacción: %', v_tipo_txn.monto_limite_defecto;
+    END IF;
+    v_requiere_aprobacion := v_tipo_txn.requiere_aprobacion;
+  END IF;
+
+  -- 8. Monto en moneda base y estado inicial
+  v_monto_base    := p_monto * p_tasa_cambio;
+  v_id_estado_txn := CASE WHEN v_requiere_aprobacion THEN v_estado_pendiente ELSE v_estado_completada END;
+
+  -- 9. Número de referencia único
+  v_numero_referencia := 'TRX-' || TO_CHAR(CURRENT_DATE, 'YYYYMMDD') || '-'
+                       || LPAD(nextval('seq_referencia_txn')::TEXT, 6, '0');
+
+  -- 10. INSERT con TODOS los campos del esquema real
+  INSERT INTO mov_transacciones (
+    numero_referencia, id_tipo_transaccion, id_sesion_caja,
+    id_caja_origen, id_caja_destino, id_sucursal_origen, id_sucursal_destino,
+    id_moneda, monto, monto_moneda_base, tasa_cambio, id_estado,
+    descripcion, numero_cheque, numero_cuenta_enmascarado,
+    nombre_cliente, tipo_instrumento, requiere_aprobacion,
+    fecha_valor, ip_origen, canal, activo, creado_por
+  ) VALUES (
+    v_numero_referencia, p_id_tipo_transaccion, p_id_sesion_caja,
+    v_id_caja_origen, p_id_caja_destino, v_id_sucursal_origen, p_id_sucursal_destino,
+    p_id_moneda, p_monto, v_monto_base, p_tasa_cambio, v_id_estado_txn,
+    p_descripcion, p_numero_cheque, p_numero_cuenta_enmascarado,
+    p_nombre_cliente, p_tipo_instrumento, v_requiere_aprobacion,
+    CURRENT_DATE, p_ip_origen, p_canal, TRUE, p_creado_por
+  ) RETURNING id INTO v_id_transaccion;
+
+  -- 11. Reservar o completar según flujo
+  IF v_tipo_txn.codigo IN ('RET', 'TRF', 'REM_O') THEN
+    IF v_requiere_aprobacion THEN
+      UPDATE tes_saldos_caja
+      SET    saldo_reservado     = saldo_reservado + p_monto,
+             ultima_actualizacion = v_ahora
+      WHERE  id_caja = v_id_caja_origen AND id_moneda = p_id_moneda;
+    ELSE
+      PERFORM fn_completar_transaccion(v_id_transaccion, p_creado_por, p_ip_origen);
+    END IF;
+  ELSIF NOT v_requiere_aprobacion THEN
+    PERFORM fn_completar_transaccion(v_id_transaccion, p_creado_por, p_ip_origen);
+  END IF;
+
+  -- 12. Alerta de fondos bajos post-operación
+  IF v_tipo_txn.codigo IN ('RET', 'TRF', 'REM_O') THEN
+    IF EXISTS (
+      SELECT 1
+      FROM   tes_saldos_caja tsc
+      JOIN   suc_cajas       sc ON sc.id = tsc.id_caja
+      WHERE  tsc.id_caja   = v_id_caja_origen
+        AND  tsc.id_moneda = p_id_moneda
+        AND  (tsc.saldo_actual - tsc.saldo_reservado) < sc.efectivo_min_permitido
+    ) THEN
+      INSERT INTO mov_alertas (id_caja, id_sucursal, tipo_alerta, nivel_criticidad, mensaje, resuelta)
+      SELECT v_id_caja_origen, v_id_sucursal_origen, 'FONDOS_BAJOS', 'AMARILLO',
+             format('Saldo bajo umbral mínimo en caja %s tras transacción %s',
+                    v_id_caja_origen, v_numero_referencia), FALSE
+      WHERE  NOT EXISTS (
+        SELECT 1 FROM mov_alertas
+        WHERE  id_caja = v_id_caja_origen AND tipo_alerta = 'FONDOS_BAJOS' AND resuelta = FALSE
+      );
+    END IF;
+  END IF;
+
+  -- 13. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_creado_por,
+    p_entidad_afectada => 'mov_transacciones',
+    p_id_registro      => v_id_transaccion,
+    p_accion           => 'INSERCION',
+    p_datos_anteriores => NULL,
+    p_datos_nuevos     => jsonb_build_object(
+                            'numero_referencia',   v_numero_referencia,
+                            'tipo',                v_tipo_txn.codigo,
+                            'monto',               p_monto,
+                            'monto_base',          v_monto_base,
+                            'requiere_aprobacion', v_requiere_aprobacion,
+                            'id_estado',           v_id_estado_txn,
+                            'creado_en',           v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_transaccion',      v_id_transaccion,
+    'numero_referencia',   v_numero_referencia,
+    'requiere_aprobacion', v_requiere_aprobacion,
+    'estado',              CASE WHEN v_requiere_aprobacion THEN 'PENDIENTE' ELSE 'COMPLETADA' END,
+    'monto',               p_monto,
+    'monto_base',          v_monto_base,
+    'creado_en',           v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 9. REVERSAR TRANSACCIÓN
+--    CAMBIO FINAL: al reversar ENTRADAS (DEP/REM_I/RPLN), reducir saldo_actual y
+--    saldo_reservado en el MISMO UPDATE para respetar CHECK (saldo_reservado <= saldo_actual)
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION reversar_transaccion(
+  p_id_transaccion BIGINT,
+  p_id_usuario     BIGINT,
+  p_motivo         TEXT,
+  p_ip_origen      INET    DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_ahora             TIMESTAMPTZ := CURRENT_TIMESTAMP;
+  v_txn               RECORD;
+  v_tipo_codigo       VARCHAR;
+  v_estado_reversada  BIGINT;
+  v_estado_completada BIGINT;
+  v_saldo_actual      NUMERIC;
+BEGIN
+
+  -- 1. Motivo obligatorio
+  IF p_motivo IS NULL OR trim(p_motivo) = '' THEN
+    RAISE EXCEPTION 'El motivo es obligatorio para reversar una transacción';
+  END IF;
+
+  -- 2. Verificar permisos del usuario
+  IF NOT EXISTS (
+    SELECT 1 FROM usr_usuarios u JOIN usr_roles r ON r.id = u.id_rol
+    WHERE  u.id = p_id_usuario AND u.activo = TRUE
+      AND  u.bloqueado = FALSE AND r.puede_aprobar = TRUE
+  ) THEN
+    RAISE EXCEPTION 'El usuario % no tiene permisos para reversar transacciones', p_id_usuario;
+  END IF;
+
+  -- 3. Resolver estados con validación
+  SELECT id INTO v_estado_completada
+  FROM   cfg_estados_transaccion WHERE codigo = 'COMPLETADA' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado COMPLETADA no existe';
+  END IF;
+
+  SELECT id INTO v_estado_reversada
+  FROM   cfg_estados_transaccion WHERE codigo = 'REVERSADA' AND activo = TRUE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Catálogo inconsistente: estado REVERSADA no existe';
+  END IF;
+
+  -- 4. Lock sobre la transacción
+  SELECT t.id_estado, t.id_tipo_transaccion, t.id_caja_origen, t.id_caja_destino,
+         t.id_sucursal_origen, t.id_sucursal_destino, t.id_moneda, t.monto, t.monto_moneda_base
+  INTO   v_txn
+  FROM   mov_transacciones t
+  WHERE  t.id = p_id_transaccion AND t.activo = TRUE
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Transacción % no encontrada o inactiva', p_id_transaccion;
+  END IF;
+
+  -- 5. Verificar estado COMPLETADA
+  IF v_txn.id_estado != v_estado_completada THEN
+    RAISE EXCEPTION 'Solo se pueden reversar transacciones COMPLETADAS (id_estado actual: %)',
+                    v_txn.id_estado;
+  END IF;
+
+  -- 6. Obtener código del tipo
+  SELECT codigo INTO v_tipo_codigo
+  FROM   cfg_tipos_transaccion WHERE id = v_txn.id_tipo_transaccion;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Tipo de transacción % no encontrado', v_txn.id_tipo_transaccion;
+  END IF;
+
+  -- 7. Marcar transacción como REVERSADA e inactiva
+  UPDATE mov_transacciones
+  SET    id_estado = v_estado_reversada, activo = FALSE
+  WHERE  id = p_id_transaccion;
+
+  -- ── Reversión de SALIDAS: devolver a origen ──────────────────────────────
+  IF v_tipo_codigo IN ('RET', 'TRF', 'REM_O') THEN
+
+    PERFORM id FROM tes_saldos_caja
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda FOR UPDATE;
+
+    -- Devolver dinero a origen: saldo_actual sube → saldo_reservado no se toca → CHECK ok
+    UPDATE tes_saldos_caja
+    SET    saldo_actual         = saldo_actual + v_txn.monto_moneda_base,
+           ultima_actualizacion = v_ahora
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda;
+
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total          = saldo_total + v_txn.monto_moneda_base,
+           saldo_disponible     = saldo_disponible + v_txn.monto_moneda_base,
+           ultima_actualizacion = v_ahora
+    WHERE  id_sucursal = v_txn.id_sucursal_origen AND id_moneda = v_txn.id_moneda;
+
+    -- TRF: descontar de destino
+    IF v_tipo_codigo = 'TRF' AND v_txn.id_caja_destino IS NOT NULL THEN
+      SELECT saldo_actual INTO v_saldo_actual
+      FROM   tes_saldos_caja
+      WHERE  id_caja = v_txn.id_caja_destino AND id_moneda = v_txn.id_moneda FOR UPDATE;
+
+      IF COALESCE(v_saldo_actual, 0) < v_txn.monto_moneda_base THEN
+        RAISE EXCEPTION 'Saldo insuficiente en caja destino % para reversar. Disponible: %, Requerido: %',
+                        v_txn.id_caja_destino, COALESCE(v_saldo_actual, 0), v_txn.monto_moneda_base;
+      END IF;
+
+      -- CAMBIO CLAVE: saldo_actual y saldo_reservado en el MISMO UPDATE
+      UPDATE tes_saldos_caja
+      SET    saldo_actual         = saldo_actual - v_txn.monto_moneda_base,
+             saldo_reservado      = GREATEST(saldo_reservado - v_txn.monto_moneda_base, 0),
+             ultima_actualizacion = v_ahora
+      WHERE  id_caja = v_txn.id_caja_destino AND id_moneda = v_txn.id_moneda;
+
+      IF v_txn.id_sucursal_destino IS NOT NULL
+         AND v_txn.id_sucursal_destino != v_txn.id_sucursal_origen THEN
+        -- CAMBIO CLAVE: saldo_total y saldo_disponible en el MISMO UPDATE
+        UPDATE tes_saldos_sucursal
+        SET    saldo_total          = saldo_total - v_txn.monto_moneda_base,
+               saldo_disponible     = saldo_disponible - v_txn.monto_moneda_base,
+               ultima_actualizacion = v_ahora
+        WHERE  id_sucursal = v_txn.id_sucursal_destino AND id_moneda = v_txn.id_moneda;
+      END IF;
+    END IF;
+  END IF;
+
+  -- ── Reversión de ENTRADAS: descontar de origen ───────────────────────────
+  IF v_tipo_codigo IN ('DEP', 'REM_I', 'RPLN') THEN
+
+    SELECT saldo_actual INTO v_saldo_actual
+    FROM   tes_saldos_caja
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda FOR UPDATE;
+
+    IF COALESCE(v_saldo_actual, 0) < v_txn.monto_moneda_base THEN
+      RAISE EXCEPTION 'Saldo insuficiente en caja % para reversar la entrada. Disponible: %, Requerido: %',
+                      v_txn.id_caja_origen, COALESCE(v_saldo_actual, 0), v_txn.monto_moneda_base;
+    END IF;
+
+    -- CAMBIO CLAVE: reducir saldo_actual y saldo_reservado en el MISMO UPDATE
+    -- Evita violar CHECK (saldo_reservado <= saldo_actual) si hay reservas activas
+    UPDATE tes_saldos_caja
+    SET    saldo_actual         = saldo_actual - v_txn.monto_moneda_base,
+           saldo_reservado      = GREATEST(saldo_reservado - v_txn.monto_moneda_base, 0),
+           ultima_actualizacion = v_ahora
+    WHERE  id_caja = v_txn.id_caja_origen AND id_moneda = v_txn.id_moneda;
+
+    -- CAMBIO CLAVE: saldo_total y saldo_disponible en el MISMO UPDATE
+    UPDATE tes_saldos_sucursal
+    SET    saldo_total          = saldo_total - v_txn.monto_moneda_base,
+           saldo_disponible     = saldo_disponible - v_txn.monto_moneda_base,
+           ultima_actualizacion = v_ahora
+    WHERE  id_sucursal = v_txn.id_sucursal_origen AND id_moneda = v_txn.id_moneda;
+  END IF;
+
+  -- 8. Auditoría
+  PERFORM fn_registrar_auditoria(
+    p_id_usuario       => p_id_usuario,
+    p_entidad_afectada => 'mov_transacciones',
+    p_id_registro      => p_id_transaccion,
+    p_accion           => 'ACTUALIZACION',
+    p_datos_anteriores => jsonb_build_object('id_estado', v_txn.id_estado, 'activo', TRUE),
+    p_datos_nuevos     => jsonb_build_object(
+                            'id_estado',       v_estado_reversada,
+                            'activo',          FALSE,
+                            'motivo',          p_motivo,
+                            'monto_revertido', v_txn.monto_moneda_base,
+                            'tipo',            v_tipo_codigo,
+                            'reversada_en',    v_ahora
+                          ),
+    p_ip_origen        => p_ip_origen
+  );
+
+  RETURN json_build_object(
+    'id_transaccion',  p_id_transaccion,
+    'estado',          'REVERSADA',
+    'tipo',            v_tipo_codigo,
+    'monto_revertido', v_txn.monto_moneda_base,
+    'reversada_en',    v_ahora
+  );
+
+EXCEPTION
+  WHEN OTHERS THEN RAISE;
+END;
+$$;
+
+
+-- ============================================================================================================================
+-- 10. VERIFICAR PERMISO (RLS guard — Supabase Auth)
+-- ============================================================================================================================
+
+CREATE OR REPLACE FUNCTION fn_tiene_permiso(p_codigo_permiso VARCHAR)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid TEXT;
+BEGIN
+
+  v_uid := auth.uid()::TEXT;
+
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'fn_tiene_permiso: llamada sin sesión autenticada (auth.uid() es NULL)';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM usr_permisos WHERE codigo = p_codigo_permiso AND activo = TRUE
+  ) THEN
+    RAISE EXCEPTION 'fn_tiene_permiso: el permiso % no existe o está inactivo', p_codigo_permiso;
+  END IF;
+
+  RETURN (
+    EXISTS (
+      SELECT 1
+      FROM   usr_usuarios u
+      JOIN   usr_rol_permisos rp ON rp.id_rol  = u.id_rol AND rp.activo = TRUE
+      JOIN   usr_permisos     p  ON p.id        = rp.id_permiso
+                                AND p.codigo    = p_codigo_permiso
+                                AND p.activo    = TRUE
+      WHERE  u.uuid     = v_uid
+        AND  u.activo   = TRUE
+        AND  u.bloqueado = FALSE
+
+      UNION
+
+      SELECT 1
+      FROM   usr_usuarios u
+      JOIN   usr_permisos_adicionales_usuario pa
+                            ON pa.id_usuario  = u.id
+                           AND pa.tipo_otorga = 'OTORGADO'
+                           AND pa.fecha_inicio <= CURRENT_DATE
+                           AND (pa.fecha_fin IS NULL OR pa.fecha_fin >= CURRENT_DATE)
+      JOIN   usr_permisos p ON p.id      = pa.id_permiso
+                           AND p.codigo  = p_codigo_permiso
+                           AND p.activo  = TRUE
+      WHERE  u.uuid     = v_uid
+        AND  u.activo   = TRUE
+        AND  u.bloqueado = FALSE
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM   usr_usuarios u
+      JOIN   usr_permisos_adicionales_usuario pa
+                            ON pa.id_usuario  = u.id
+                           AND pa.tipo_otorga = 'REVOCADO'
+                           AND pa.fecha_inicio <= CURRENT_DATE
+                           AND (pa.fecha_fin IS NULL OR pa.fecha_fin >= CURRENT_DATE)
+      JOIN   usr_permisos p ON p.id      = pa.id_permiso
+                           AND p.codigo  = p_codigo_permiso
+                           AND p.activo  = TRUE
+      WHERE  u.uuid     = v_uid
+        AND  u.activo   = TRUE
+        AND  u.bloqueado = FALSE
+    )
+  );
+
+END;
+$$;
+
+REVOKE ALL ON FUNCTION fn_tiene_permiso(VARCHAR) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION fn_tiene_permiso(VARCHAR) TO authenticated;
+
+-- ============================================================================================================================
+-- FIN DEL SCRIPT
+-- ============================================================================================================================
